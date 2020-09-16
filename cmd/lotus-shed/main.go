@@ -38,6 +38,7 @@ func main() {
 		exportChainCmd,
 		consensusCmd,
 		serveDealStatsCmd,
+		createMsigsCmd,
 	}
 
 	app := &cli.App{
