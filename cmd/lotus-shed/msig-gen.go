@@ -26,7 +26,7 @@ type CreateParams struct {
 	Name          string
 	Entity        string
 	Hash          string
-	Amount        types.FIL
+	Amount        string
 	VestingMonths int
 	Custodian     string
 	MultisigM     int
@@ -86,17 +86,21 @@ var msigCreationStatusCmd = &cli.Command{
 			if job.CreateCID != cid.Undef {
 				r, err := api.StateGetReceipt(ctx, job.CreateCID, types.EmptyTSK)
 				if err != nil {
-					log.Warnf("no receipt found for %s", job.CreateCID)
+					return fmt.Errorf("failed to get receipt: %w", err)
 				} else {
-					if r.ExitCode != 0 {
-						fmt.Printf("creation job failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
+					if r == nil {
+						fmt.Printf("no receipt found yet for %s\n", job.CreateCID)
 					} else {
-						var er iact.ExecReturn
-						if err := er.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
-							return xerrors.Errorf("return value of create message failed to parse: %w", err)
-						}
+						if r.ExitCode != 0 {
+							fmt.Printf("creation job failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
+						} else {
+							var er iact.ExecReturn
+							if err := er.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
+								return xerrors.Errorf("return value of create message failed to parse: %w", err)
+							}
 
-						fmt.Printf("actor create successful: %s %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, er.RobustAddress)
+							fmt.Printf("actor create successful: %s %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, er.RobustAddress)
+						}
 					}
 				}
 			}
@@ -133,7 +137,11 @@ var msigCreateStartCmd = &cli.Command{
 
 		var createAddr address.Address
 		if ca := cctx.String("creator"); ca != "" {
-
+			caddr, err := address.NewFromString(ca)
+			if err != nil {
+				return err
+			}
+			createAddr = caddr
 		} else {
 			return fmt.Errorf("must specify creator address through flag")
 		}
@@ -150,7 +158,7 @@ var msigCreateStartCmd = &cli.Command{
 		for _, p := range params {
 			createCid, err := api.MsigCreate(ctx, 1, append(p.Addresses, createAddr), 0, types.NewInt(0), createAddr, types.NewInt(0))
 			if err != nil {
-				return err
+				return xerrors.Errorf("failed to create multisigs: %w", err)
 			}
 
 			cd.Jobs = append(cd.Jobs, MsigCreationProgress{
@@ -202,18 +210,18 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 			return nil, fmt.Errorf("failed to parse vesting months field of row %d: %w", i, err)
 		}
 
-		msigM, err := strconv.Atoi(r[6])
+		msigM, err := strconv.Atoi(r[5])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse msigM field of row %d: %w", i, err)
 		}
 
-		msigN, err := strconv.Atoi(r[7])
+		msigN, err := strconv.Atoi(r[6])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse msigN field of row %d: %w", i, err)
 		}
 
 		var addresses []address.Address
-		for j, a := range strings.Split(r[8], ":") {
+		for j, a := range strings.Split(r[7], ":") {
 			addr, err := address.NewFromString(a)
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse address %d on row %d: %w", j, i, err)
@@ -228,7 +236,7 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 			Name:          r[0],
 			Entity:        r[1],
 			Hash:          r[2],
-			Amount:        amt,
+			Amount:        amt.String(),
 			VestingMonths: vmonths,
 			Custodian:     r[5],
 			MultisigM:     msigM,
