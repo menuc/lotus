@@ -17,7 +17,9 @@ import (
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 
+	"github.com/filecoin-project/specs-actors/actors/builtin"
 	iact "github.com/filecoin-project/specs-actors/actors/builtin/init"
+	msig "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 )
 
 type CreateParams struct {
@@ -33,21 +35,22 @@ type CreateParams struct {
 }
 
 type MsigCreationProgress struct {
-	Params    CreateParams
-	CreateCID cid.Cid
-	ActorID   address.Address
-	Complete  bool
+	Params        CreateParams
+	CreateCID     cid.Cid
+	SetVestingCID cid.Cid
+	ActorID       address.Address
+	Complete      bool
 }
 
 type MsigCreationData struct {
-	Jobs    []MsigCreationProgress
+	Jobs    []*MsigCreationProgress
 	Creator address.Address
 }
 
 var createMsigsCmd = &cli.Command{
 	Name: "create-msigs",
 	Subcommands: []*cli.Command{
-		msigPhase1Cmd,
+		msigCreateStartCmd,
 		msigCreationStatusCmd,
 	},
 }
@@ -103,9 +106,9 @@ var msigCreationStatusCmd = &cli.Command{
 	},
 }
 
-var msigPhase1Cmd = &cli.Command{
-	Name:        "phase1",
-	Description: "phase 1 of multisig accounts creation, parses initial csv input and sends creation messages for each, recording the message cid in the output file",
+var msigCreateStartCmd = &cli.Command{
+	Name:        "start",
+	Description: "start of multisig accounts creation, parses initial csv input and sends creation messages for each, recording the message cid in the output file",
 	Flags: []cli.Flag{
 		&cli.Uint64Flag{
 			Name: "vesting-start",
@@ -236,4 +239,69 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+var msigCreateNextCmd = &cli.Command{
+	Name:        "next",
+	Description: "perform next required processing for multisig creation",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		for _, job := range msd.Jobs {
+			if job.ActorID == address.Undef {
+				r, err := api.StateGetReceipt(ctx, job.CreateCID, types.EmptyTSK)
+				if err != nil {
+					log.Warnf("no receipt found for %s", job.CreateCID)
+				} else {
+					if r.ExitCode != 0 {
+						fmt.Printf("creation job failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
+					} else {
+						var er iact.ExecReturn
+						if err := er.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
+							return xerrors.Errorf("return value of create message failed to parse: %w", err)
+						}
+
+						fmt.Printf("actor create successful: %s %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, er.RobustAddress)
+						job.ActorID = er.RobustAddress
+					}
+				}
+			}
+
+			if job.ActorID != address.Undef && !job.SetVestingCID.Defined() {
+				params := msig.LockBalanceParams{
+					StartEpoch:     0,
+					UnlockDuration: 1,
+					Amount:         job.Params.Amount,
+				}
+				msg := &types.Message{
+					From:   msd.Creator,
+					To:     job.ActorID,
+					Method: builtin.MethodsMultisig.LockBalance,
+				}
+			}
+		}
+
+		return nil
+	},
 }
