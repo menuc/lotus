@@ -41,6 +41,7 @@ type MsigCreationProgress struct {
 	CreateCID     cid.Cid
 	SetVestingCID cid.Cid
 	ActorID       address.Address
+	FundsLocked   bool
 	Complete      bool
 }
 
@@ -295,8 +296,15 @@ var msigCreateNextCmd = &cli.Command{
 			return nil
 		}
 
+		var progress int
 		for _, job := range msd.Jobs {
+			if job.Complete {
+				fmt.Printf("Jobs complete: %d / %d\n", progress, len(msd.Jobs))
+				progress++
+				continue
+			}
 			if job.ActorID == address.Undef {
+				fmt.Println("finding creation receipt for ", job.Params.Name)
 				r, err := api.StateGetReceipt(ctx, job.CreateCID, types.EmptyTSK)
 				if err != nil {
 					log.Warnf("no receipt found for %s", job.CreateCID)
@@ -340,11 +348,29 @@ var msigCreateNextCmd = &cli.Command{
 					return err
 				}
 
-				msg := &types.Message{
-					From:   msd.Creator,
-					To:     job.ActorID,
+				addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
+				if err != nil {
+					fmt.Printf("failed to look up actor ID for %s (%s): %w", job.ActorID, job.Params.Name, err)
+					continue
+				}
+
+				prop := msig.ProposeParams{
+					To:     addr,
+					Value:  abi.NewTokenAmount(0),
 					Method: builtin.MethodsMultisig.LockBalance,
 					Params: buf.Bytes(),
+				}
+
+				buf2 := new(bytes.Buffer)
+				if err := prop.MarshalCBOR(buf2); err != nil {
+					return err
+				}
+
+				msg := &types.Message{
+					From:   msd.Creator,
+					To:     addr,
+					Method: builtin.MethodsMultisig.Propose,
+					Params: buf2.Bytes(),
 				}
 
 				sm, err := api.MpoolPushMessage(ctx, msg, nil)
@@ -356,6 +382,45 @@ var msigCreateNextCmd = &cli.Command{
 				if err := writeProgress(); err != nil {
 					return err
 				}
+				fmt.Printf("proposed funds locking for %s in %s\n", job.Params.Name, sm.Cid())
+			}
+
+			if job.SetVestingCID.Defined() && !job.FundsLocked {
+				fmt.Println("finding funds locking receipt for ", job.Params.Name)
+				r, err := api.StateGetReceipt(ctx, job.SetVestingCID, types.EmptyTSK)
+				if err != nil {
+					log.Warnf("no receipt found for %s: %w", job.CreateCID, err)
+				} else {
+					if r != nil {
+						if r.ExitCode != 0 {
+							fmt.Printf("funds locking failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
+						} else {
+							var pr msig.ProposeReturn
+							if err := pr.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
+								return xerrors.Errorf("return value of lock funds message failed to parse: %w", err)
+							}
+
+							if pr.Code != 0 {
+								fmt.Printf("ERROR: funds locking message failed for %s, exitcode %d", job.Params.Name, pr.Code)
+								continue
+							}
+
+							if !pr.Applied {
+								fmt.Printf("ERROR: funds locking message was not applied for %s\n", job.Params.Name)
+								continue
+							}
+
+							fmt.Printf("funds locking successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
+							job.FundsLocked = true
+							if err := writeProgress(); err != nil {
+								return err
+							}
+						}
+					} else {
+						fmt.Printf("funds locking message for %s hasnt made it into the chain yet\n", job.Params.Name)
+					}
+				}
+
 			}
 		}
 
