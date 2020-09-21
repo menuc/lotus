@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
@@ -63,6 +64,8 @@ type MsigCreationProgress struct {
 	ControlChanged   bool
 
 	Complete bool
+
+	SentFunds cid.Cid
 }
 
 type MsigCreationData struct {
@@ -77,6 +80,7 @@ var createMsigsCmd = &cli.Command{
 		msigCreationStatusCmd,
 		msigCreateNextCmd,
 		msigCreateVerifyCmd,
+		msigCreateFillCmd,
 	},
 }
 
@@ -462,12 +466,14 @@ var msigCreateNextCmd = &cli.Command{
 
 			if job.ControlChanged {
 				// nothing else to do, this ones complete
+				progress++
 				job.Complete = true
 				if err := writeProgress(); err != nil {
 					return err
 				}
 			}
 		}
+		fmt.Printf("%d / %d Jobs complete\n", progress, len(msd.Jobs))
 
 		return nil
 	},
@@ -601,11 +607,11 @@ var msigCreateVerifyCmd = &cli.Command{
 				}
 
 				balanceGood := act.Balance.Equals(big.Int(amt))
-				goodbad(balanceGood, "\tBalance: %s", types.FIL(act.Balance))
+				extra := ""
 				if !balanceGood {
-					fmt.Printf("\t(should be %s)", amt)
+					extra = fmt.Sprintf("\t(should be %s)", amt)
 				}
-				fmt.Println()
+				goodbad(balanceGood, "\tBalance: %s%s\n", types.FIL(act.Balance), extra)
 
 				if act.Code != builtin.MultisigActorCodeID {
 					fmt.Println("NOT A MULTISIG!!")
@@ -627,9 +633,12 @@ var msigCreateVerifyCmd = &cli.Command{
 
 				expDuration := abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths)
 				durGood := msigst.UnlockDuration == expDuration
-				goodbad(durGood, "\tVesting Duration: %d\n", msigst.UnlockDuration)
+				goodbad(durGood, "\tVesting Duration: %d (%d months)\n", msigst.UnlockDuration, msigst.UnlockDuration/blocksInAMonth)
 				expSpendable := types.FIL(types.BigSub(big.Int(amt), msigst.AmountLocked(curTs.Height())))
-				fmt.Printf("\tSpendable: %s (exp: %s)\n", types.FIL(types.BigSub(act.Balance, msigst.AmountLocked(curTs.Height()))), expSpendable)
+				elapsedPerc := 100 * float64(curTs.Height()-msigst.StartEpoch) / float64(msigst.UnlockDuration)
+				fmt.Printf("\tSpendable: (%0.1f) %s (exp: %s)\n", elapsedPerc, types.FIL(types.BigSub(act.Balance, msigst.AmountLocked(curTs.Height()))), expSpendable)
+
+				fmt.Println()
 			}
 		}
 
@@ -665,4 +674,143 @@ func addressesAreSame(s1, s2 []address.Address) bool {
 	}
 
 	return true
+}
+
+var msigCreateFillCmd = &cli.Command{
+	Name:        "fill",
+	Description: "fill wallets with appropriate funds from source funding pool",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "source",
+			Usage: "source account to pull funds from",
+		},
+		&cli.StringFlag{
+			Name:  "signer",
+			Usage: "address of signer for the 'source' multisig",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		writeProgress := func() error {
+			nfi, err := os.Create(cctx.Args().First())
+			if err != nil {
+				return fmt.Errorf("failed to open file: %w", err)
+			}
+			defer nfi.Close()
+
+			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
+				return fmt.Errorf("failed to write progress out to a file: %w", err)
+			}
+
+			return nil
+		}
+
+		sourceAddr, err := address.NewFromString(cctx.String("source"))
+		if err != nil {
+			return fmt.Errorf("failed to parse 'source' address: %w", err)
+		}
+
+		signerAddr, err := address.NewFromString(cctx.String("signer"))
+		if err != nil {
+			return fmt.Errorf("failed to parse 'signer' address: %w", err)
+		}
+
+		for _, job := range msd.Jobs {
+			addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
+			if err != nil {
+				return fmt.Errorf("failed to lookup ID: %w", err)
+			}
+
+			fmt.Printf("Wallet %s - %s\n", jobStr(job), addr)
+			targetAmt, err := types.ParseFIL(job.Params.Amount)
+			if err != nil {
+				return fmt.Errorf("failed to parse amount param: %w", err)
+			}
+
+			act, err := api.StateGetActor(ctx, addr, types.EmptyTSK)
+			if err != nil {
+				return fmt.Errorf("failed to find actor: %w", err)
+			}
+
+			fmt.Printf("\tCurrent balance: %s\n", types.FIL(act.Balance))
+			fmt.Printf("\tTarget balance: %s\n", targetAmt)
+
+			toSend := types.BigSub(big.Int(targetAmt), act.Balance)
+			if toSend.Sign() <= 0 {
+				fmt.Printf("Balance is sufficient, continuing...\n\n")
+				continue
+			}
+			fmt.Printf("\n\tAbout to send %s to %s (%s)\nPlease confirm by typing YES\n", toSend, addr, job.ActorID)
+			if !readYes() {
+				fmt.Println("aborting...")
+				return nil
+			}
+
+			if job.SentFunds.Defined() {
+				fmt.Println("funds already sent to target account: ", job.SentFunds)
+				continue
+			}
+
+			params := &msig.ProposeParams{
+				To:    job.ActorID,
+				Value: toSend,
+			}
+
+			buf := new(bytes.Buffer)
+			if err := params.MarshalCBOR(buf); err != nil {
+				return err
+			}
+
+			msg := &types.Message{
+				From:   signerAddr,
+				To:     sourceAddr,
+				Method: builtin.MethodsMultisig.Propose,
+				Params: buf.Bytes(),
+			}
+
+			sm, err := api.MpoolPushMessage(ctx, msg, nil)
+			if err != nil {
+				return fmt.Errorf("failed to push message: %w", err)
+			}
+
+			job.SentFunds = sm.Cid()
+			if err := writeProgress(); err != nil {
+				return fmt.Errorf("failed to write progress after sending funds: %w", err)
+			}
+		}
+		return nil
+	},
+}
+
+func readYes() bool {
+	sc := bufio.NewReader(os.Stdin)
+	line, _, err := sc.ReadLine()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("YOU TYPED: %q\n", string(line))
+	return string(line) == "YES"
 }
