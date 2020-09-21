@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 
@@ -37,12 +40,20 @@ type CreateParams struct {
 }
 
 type MsigCreationProgress struct {
-	Params        CreateParams
-	CreateCID     cid.Cid
+	Params    CreateParams
+	CreateCID cid.Cid
+	ActorID   address.Address
+
 	SetVestingCID cid.Cid
-	ActorID       address.Address
 	FundsLocked   bool
-	Complete      bool
+
+	SetThresholdCID cid.Cid
+	ThresholdSet    bool
+
+	RemoveControlCID cid.Cid
+	ControlChanged   bool
+
+	Complete bool
 }
 
 type MsigCreationData struct {
@@ -350,7 +361,7 @@ var msigCreateNextCmd = &cli.Command{
 
 				addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
 				if err != nil {
-					fmt.Printf("failed to look up actor ID for %s (%s): %w", job.ActorID, job.Params.Name, err)
+					fmt.Printf("failed to look up actor ID for %s (%s): %s", job.ActorID, job.Params.Name, err)
 					continue
 				}
 
@@ -387,43 +398,131 @@ var msigCreateNextCmd = &cli.Command{
 
 			if job.SetVestingCID.Defined() && !job.FundsLocked {
 				fmt.Println("finding funds locking receipt for ", job.Params.Name)
-				r, err := api.StateGetReceipt(ctx, job.SetVestingCID, types.EmptyTSK)
-				if err != nil {
-					log.Warnf("no receipt found for %s: %w", job.CreateCID, err)
-				} else {
-					if r != nil {
-						if r.ExitCode != 0 {
-							fmt.Printf("funds locking failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
-						} else {
-							var pr msig.ProposeReturn
-							if err := pr.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
-								return xerrors.Errorf("return value of lock funds message failed to parse: %w", err)
-							}
-
-							if pr.Code != 0 {
-								fmt.Printf("ERROR: funds locking message failed for %s, exitcode %d", job.Params.Name, pr.Code)
-								continue
-							}
-
-							if !pr.Applied {
-								fmt.Printf("ERROR: funds locking message was not applied for %s\n", job.Params.Name)
-								continue
-							}
-
-							fmt.Printf("funds locking successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
-							job.FundsLocked = true
-							if err := writeProgress(); err != nil {
-								return err
-							}
-						}
-					} else {
-						fmt.Printf("funds locking message for %s hasnt made it into the chain yet\n", job.Params.Name)
-					}
+				if err := checkProposeReceipt(ctx, api, job.SetVestingCID); err != nil {
+					fmt.Printf("set vesting (%s %s %s) not complete: %s", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+					continue
 				}
 
+				fmt.Printf("funds locking successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
+				job.FundsLocked = true
+				if err := writeProgress(); err != nil {
+					return err
+				}
+
+			}
+
+			if job.Params.MultisigM == 1 && !job.ThresholdSet {
+				job.ThresholdSet = true
+				fmt.Printf("no need to change threshold for %s, already 1\n", job.Params.Name)
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			}
+
+			if job.FundsLocked && job.Params.MultisigM != 1 && !job.SetThresholdCID.Defined() {
+				params := &msig.ChangeNumApprovalsThresholdParams{
+					NewThreshold: uint64(job.Params.MultisigM),
+				}
+
+				mcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.ChangeNumApprovalsThreshold)
+				if err != nil {
+					return fmt.Errorf("failed to propose approval threshold change for %s %s %s: %w", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+				}
+
+				job.SetThresholdCID = mcid
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			}
+
+			if job.SetThresholdCID.Defined() && !job.ThresholdSet {
+				fmt.Println("finding set threshold receipt for ", job.Params.Name)
+				if err := checkProposeReceipt(ctx, api, job.SetThresholdCID); err != nil {
+					fmt.Printf("set threshold (%s %s %s) not complete: %s", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+					continue
+				}
+
+				fmt.Printf("set threshold successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
+				job.ThresholdSet = true
+				if err := writeProgress(); err != nil {
+					return err
+				}
 			}
 		}
 
 		return nil
 	},
+}
+
+func checkProposeReceipt(ctx context.Context, api api.FullNode, c cid.Cid) error {
+	r, err := api.StateGetReceipt(ctx, c, types.EmptyTSK)
+	if err != nil {
+		return fmt.Errorf("finding receipt failed: %w", err)
+	}
+
+	if r == nil {
+		return fmt.Errorf("message hasnt made it into the chain yet")
+	}
+
+	if r.ExitCode != 0 {
+		return fmt.Errorf("propose receipt had nonzero exitcode: %d", r.ExitCode)
+	}
+
+	var pr msig.ProposeReturn
+	if err := pr.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
+		return xerrors.Errorf("return value of %s failed to parse: %w", c, err)
+	}
+
+	if pr.Code != 0 {
+		return fmt.Errorf("multisig operation failed: %d", pr.Code)
+	}
+
+	if !pr.Applied {
+		return fmt.Errorf("operation not applied")
+	}
+
+	return nil
+}
+
+type cborMarshaler interface {
+	MarshalCBOR(io.Writer) error
+}
+
+func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, act address.Address, params cborMarshaler, method abi.MethodNum) (cid.Cid, error) {
+	buf := new(bytes.Buffer)
+	if err := params.MarshalCBOR(buf); err != nil {
+		return cid.Undef, fmt.Errorf("failed to marshal parameters: %w", err)
+	}
+
+	addr, err := api.StateLookupID(ctx, act, types.EmptyTSK)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("failed to look up actor ID for %s: %s", act, err)
+	}
+
+	prop := msig.ProposeParams{
+		To:     addr,
+		Value:  abi.NewTokenAmount(0),
+		Method: builtin.MethodsMultisig.LockBalance,
+		Params: buf.Bytes(),
+	}
+
+	buf2 := new(bytes.Buffer)
+	if err := prop.MarshalCBOR(buf2); err != nil {
+		return cid.Undef, err
+	}
+
+	msg := &types.Message{
+		From:   sender,
+		To:     addr,
+		Method: method,
+		Params: buf2.Bytes(),
+	}
+
+	sm, err := api.MpoolPushMessage(ctx, msg, nil)
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	return sm.Cid(), nil
+
 }
