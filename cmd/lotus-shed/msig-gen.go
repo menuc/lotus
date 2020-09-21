@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/fatih/color"
 	"github.com/ipfs/go-cid"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
@@ -37,6 +39,10 @@ type CreateParams struct {
 	MultisigM     int
 	MultisigN     int
 	Addresses     []address.Address
+}
+
+func jobStr(job *MsigCreationProgress) string {
+	return fmt.Sprintf("%s %s %s", job.Params.Name, job.Params.Custodian, job.Params.Entity)
 }
 
 type MsigCreationProgress struct {
@@ -525,4 +531,100 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 
 	return sm.Cid(), nil
 
+}
+
+var msigCreationVerifyCmd = &cli.Command{
+	Name:        "verify",
+	Description: "verify wallets were properly setup",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		for _, job := range msd.Jobs {
+			if !job.Complete {
+				fmt.Printf("%s not complete\n", jobStr(job))
+			} else {
+				act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
+				if err != nil {
+					return fmt.Errorf("failed to get actor: %w", err)
+				}
+				fmt.Printf("Wallet: %s - %s\n", jobStr(job), job.ActorID)
+
+				addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
+				if err != nil {
+					return err
+				}
+
+				fmt.Printf("\tID: %s", addr)
+
+				fmt.Printf("\tBalance: %s\n", act.Balance)
+				if act.Code != builtin.MultisigActorCodeID {
+					fmt.Println("NOT A MULTISIG!!")
+					continue
+				}
+
+				data, err := api.ChainReadObj(ctx, act.Head)
+				if err != nil {
+					return fmt.Errorf("failed to read state: %w", err)
+				}
+
+				var msigst msig.State
+				if err := msigst.UnmarshalCBOR(bytes.NewReader(data)); err != nil {
+					return err
+				}
+
+				addrsCorrect := addressesAreSame(job.Params.Addresses, msigst.Signers)
+				pf := color.Red
+				if addrsCorrect {
+					pf = color.Green
+				}
+				pf("\t%s\n", msigst.Signers)
+
+			}
+		}
+
+		return nil
+	},
+}
+
+func addressesAreSame(s1, s2 []address.Address) bool {
+	sort.Slice(s1, func(i, j int) bool {
+		return s1[i].String() < s1[j].String()
+	})
+
+	sort.Slice(s2, func(i, j int) bool {
+		return s2[i].String() < s2[j].String()
+	})
+
+	if len(s1) != len(s2) {
+		return false
+	}
+
+	for i := 0; i < len(s1); i++ {
+		if s1[i] != s2[i] {
+			return false
+		}
+	}
+
+	return true
 }
