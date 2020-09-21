@@ -527,7 +527,7 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 	prop := msig.ProposeParams{
 		To:     addr,
 		Value:  abi.NewTokenAmount(0),
-		Method: builtin.MethodsMultisig.LockBalance,
+		Method: method,
 		Params: buf.Bytes(),
 	}
 
@@ -539,13 +539,13 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 	msg := &types.Message{
 		From:   sender,
 		To:     addr,
-		Method: method,
+		Method: builtin.MethodsMultisig.Propose,
 		Params: buf2.Bytes(),
 	}
 
 	sm, err := api.MpoolPushMessage(ctx, msg, nil)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, fmt.Errorf("failed to push message: %w", err)
 	}
 
 	return sm.Cid(), nil
