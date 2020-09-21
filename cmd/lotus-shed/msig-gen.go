@@ -568,6 +568,11 @@ var msigCreateVerifyCmd = &cli.Command{
 			return err
 		}
 
+		curTs, err := api.ChainHead(ctx)
+		if err != nil {
+			return err
+		}
+
 		var msd MsigCreationData
 		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
 			return err
@@ -588,14 +593,19 @@ var msigCreateVerifyCmd = &cli.Command{
 					return err
 				}
 
-				fmt.Printf("\tID: %s", addr)
+				fmt.Printf("\tID: %s\n", addr)
 
 				amt, err := types.ParseFIL(job.Params.Amount)
 				if err != nil {
 					return fmt.Errorf("failed to parse amount in job create params: %w", err)
 				}
 
-				goodbad(act.Balance.Equals(big.Int(amt)), "\tBalance: %s\n", types.FIL(act.Balance))
+				balanceGood := act.Balance.Equals(big.Int(amt))
+				goodbad(balanceGood, "\tBalance: %s", types.FIL(act.Balance))
+				if !balanceGood {
+					fmt.Printf("\t(should be %s)", amt)
+				}
+				fmt.Println()
 
 				if act.Code != builtin.MultisigActorCodeID {
 					fmt.Println("NOT A MULTISIG!!")
@@ -618,6 +628,8 @@ var msigCreateVerifyCmd = &cli.Command{
 				expDuration := abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths)
 				durGood := msigst.UnlockDuration == expDuration
 				goodbad(durGood, "\tVesting Duration: %d\n", msigst.UnlockDuration)
+				expSpendable := types.FIL(types.BigSub(big.Int(amt), msigst.AmountLocked(curTs.Height())))
+				fmt.Printf("\tSpendable: %s (exp: %s)\n", types.FIL(types.BigSub(act.Balance, msigst.AmountLocked(curTs.Height()))), expSpendable)
 			}
 		}
 
