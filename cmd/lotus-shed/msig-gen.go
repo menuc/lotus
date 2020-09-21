@@ -29,6 +29,9 @@ import (
 	msig "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 )
 
+const blocksInADay = (24 * 60 * 60) / 30
+const blocksInAMonth = (blocksInADay * 365) / 12
+
 type CreateParams struct {
 	Name          string
 	Entity        string
@@ -73,6 +76,7 @@ var createMsigsCmd = &cli.Command{
 		msigCreateStartCmd,
 		msigCreationStatusCmd,
 		msigCreateNextCmd,
+		msigCreateVerifyCmd,
 	},
 }
 
@@ -352,54 +356,22 @@ var msigCreateNextCmd = &cli.Command{
 				if err != nil {
 					return xerrors.Errorf("failed to parse fil amount: %w", err)
 				}
-				const blocksInADay = (24 * 60 * 60) / 30
-				const blocksInAMonth = (blocksInADay * 365) / 12
-				params := msig.LockBalanceParams{
+				params := &msig.LockBalanceParams{
 					StartEpoch:     0,
 					UnlockDuration: abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths),
 					Amount:         big.Int(famt),
 				}
 
-				buf := new(bytes.Buffer)
-				if err := params.MarshalCBOR(buf); err != nil {
-					return err
-				}
-
-				addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
+				lmcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.LockBalance)
 				if err != nil {
-					fmt.Printf("failed to look up actor ID for %s (%s): %s", job.ActorID, job.Params.Name, err)
-					continue
+					return fmt.Errorf("failed to propose lock funds operation on %s: %w", jobStr(job), err)
 				}
 
-				prop := msig.ProposeParams{
-					To:     addr,
-					Value:  abi.NewTokenAmount(0),
-					Method: builtin.MethodsMultisig.LockBalance,
-					Params: buf.Bytes(),
-				}
-
-				buf2 := new(bytes.Buffer)
-				if err := prop.MarshalCBOR(buf2); err != nil {
-					return err
-				}
-
-				msg := &types.Message{
-					From:   msd.Creator,
-					To:     addr,
-					Method: builtin.MethodsMultisig.Propose,
-					Params: buf2.Bytes(),
-				}
-
-				sm, err := api.MpoolPushMessage(ctx, msg, nil)
-				if err != nil {
-					return err
-				}
-
-				job.SetVestingCID = sm.Cid()
+				job.SetVestingCID = lmcid
 				if err := writeProgress(); err != nil {
 					return err
 				}
-				fmt.Printf("proposed funds locking for %s in %s\n", job.Params.Name, sm.Cid())
+				fmt.Printf("proposed funds locking for %s in %s\n", job.Params.Name, lmcid)
 			}
 
 			if job.SetVestingCID.Defined() && !job.FundsLocked {
@@ -450,6 +422,47 @@ var msigCreateNextCmd = &cli.Command{
 
 				fmt.Printf("set threshold successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
 				job.ThresholdSet = true
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			}
+
+			if job.ThresholdSet && !job.RemoveControlCID.Defined() {
+				params := &msig.RemoveSignerParams{
+					Signer: msd.Creator,
+				}
+
+				fmt.Println("Proposing removal of control address on ", job.ActorID)
+				mcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
+				if err != nil {
+					return fmt.Errorf("failed to propose remove signer for %s %s %s: %w", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+				}
+
+				job.RemoveControlCID = mcid
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			}
+
+			if !job.ControlChanged && job.RemoveControlCID.Defined() {
+				if job.Params.MultisigM == 1 {
+					fmt.Println("finding remove control address message for ", job.Params.Name)
+					if err := checkProposeReceipt(ctx, api, job.RemoveControlCID); err != nil {
+						fmt.Println("removing control address not complete")
+						continue
+					}
+
+					fmt.Println("proposal of address removal complete")
+				}
+				job.ControlChanged = true // eh, close enough
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			}
+
+			if job.ControlChanged {
+				// nothing else to do, this ones complete
+				job.Complete = true
 				if err := writeProgress(); err != nil {
 					return err
 				}
@@ -533,7 +546,7 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 
 }
 
-var msigCreationVerifyCmd = &cli.Command{
+var msigCreateVerifyCmd = &cli.Command{
 	Name:        "verify",
 	Description: "verify wallets were properly setup",
 	Flags:       []cli.Flag{},
@@ -577,7 +590,13 @@ var msigCreationVerifyCmd = &cli.Command{
 
 				fmt.Printf("\tID: %s", addr)
 
-				fmt.Printf("\tBalance: %s\n", act.Balance)
+				amt, err := types.ParseFIL(job.Params.Amount)
+				if err != nil {
+					return fmt.Errorf("failed to parse amount in job create params: %w", err)
+				}
+
+				goodbad(act.Balance.Equals(big.Int(amt)), "\tBalance: %s\n", types.FIL(act.Balance))
+
 				if act.Code != builtin.MultisigActorCodeID {
 					fmt.Println("NOT A MULTISIG!!")
 					continue
@@ -594,17 +613,24 @@ var msigCreationVerifyCmd = &cli.Command{
 				}
 
 				addrsCorrect := addressesAreSame(job.Params.Addresses, msigst.Signers)
-				pf := color.Red
-				if addrsCorrect {
-					pf = color.Green
-				}
-				pf("\t%s\n", msigst.Signers)
+				goodbad(addrsCorrect, "\t%s\n", msigst.Signers)
 
+				expDuration := abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths)
+				durGood := msigst.UnlockDuration == expDuration
+				goodbad(durGood, "\tVesting Duration: %d\n", msigst.UnlockDuration)
 			}
 		}
 
 		return nil
 	},
+}
+
+func goodbad(good bool, format string, args ...interface{}) {
+	if good {
+		color.Green(format, args...)
+	} else {
+		color.Red(format, args...)
+	}
 }
 
 func addressesAreSame(s1, s2 []address.Address) bool {
