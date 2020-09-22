@@ -82,7 +82,7 @@ var createMsigsCmd = &cli.Command{
 		msigCreateNextCmd,
 		msigCreateVerifyCmd,
 		msigCreateFillCmd,
-		msigCreatePaymentConfirmationAuditCmd,
+		msigCreateAuditsCmd,
 	},
 }
 
@@ -837,8 +837,69 @@ func readYes() bool {
 	return string(line) == "YES"
 }
 
+var msigCreateAuditsCmd = &cli.Command{
+	Name:        "audit",
+	Description: "a collection of commands for auditing the process",
+	Subcommands: []*cli.Command{
+		msigCreatePaymentConfirmationAuditCmd,
+		msigCreateAuditCreatesCmd,
+	},
+}
+
+var msigCreateAuditCreatesCmd = &cli.Command{
+	Name:        "creates",
+	Description: "produce an audit report of all created multisigs",
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		fmt.Printf("Hash,Address,ID,Balance,VestingAmount,VestingStart,VestingDuration,Signers\n")
+		for _, job := range msd.Jobs {
+			if job.ActorID == address.Undef {
+				fmt.Printf("%s,,,,,,,\n", job.Params.Hash)
+				continue
+			}
+
+			st, act, err := getMsigState(ctx, api, job.ActorID)
+			if err != nil {
+				return fmt.Errorf("failed to get state: %w", err)
+			}
+
+			actId, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
+			if err != nil {
+				return fmt.Errorf("failed to lookup actor ID: %w", err)
+			}
+
+			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%s\n", job.Params.Hash, job.ActorID, actId, act.Balance, st.InitialBalance, st.StartEpoch, st.UnlockDuration, addrsToColonString(st.Signers))
+
+		}
+		return nil
+	},
+}
+
 var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
-	Name:        "audit-sends",
+	Name:        "sends",
 	Description: "output a csv of all the proposed sends for funding wallets",
 	Flags: []cli.Flag{
 		&cli.StringFlag{
@@ -911,10 +972,6 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 
 		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,TxnID,Value\n")
 		for _, job := range msd.Jobs {
-			var sigs []string
-			for _, s := range msigst.Signers {
-				sigs = append(sigs, s.String())
-			}
 
 			tid := int64(-1)
 			value := abi.NewTokenAmount(0)
@@ -928,9 +985,37 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 				return fmt.Errorf("failed to get actor %s: %w", job.ActorID, err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, strings.Join(sigs, ":"), types.FIL(act.Balance), tid, value)
+			fmt.Printf("%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), tid, value)
 		}
 
 		return nil
 	},
+}
+
+func addrsToColonString(addrs []address.Address) string {
+	var a []string
+	for _, s := range addrs {
+		a = append(a, s.String())
+	}
+	return strings.Join(a, ":")
+
+}
+
+func getMsigState(ctx context.Context, api api.FullNode, addr address.Address) (*msig.State, *types.Actor, error) {
+	act, err := api.StateGetActor(ctx, addr, types.EmptyTSK)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	data, err := api.ChainReadObj(ctx, act.Head)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var msigst msig.State
+	if err := msigst.UnmarshalCBOR(bytes.NewReader(data)); err != nil {
+		return nil, nil, err
+	}
+
+	return &msigst, act, nil
 }
