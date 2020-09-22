@@ -81,6 +81,7 @@ var createMsigsCmd = &cli.Command{
 		msigCreateNextCmd,
 		msigCreateVerifyCmd,
 		msigCreateFillCmd,
+		msigCreatePaymentConfirmationAuditCmd,
 	},
 }
 
@@ -381,7 +382,7 @@ var msigCreateNextCmd = &cli.Command{
 			if job.SetVestingCID.Defined() && !job.FundsLocked {
 				fmt.Println("finding funds locking receipt for ", job.Params.Name)
 				if err := checkProposeReceipt(ctx, api, job.SetVestingCID); err != nil {
-					fmt.Printf("set vesting (%s %s %s) not complete: %s", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+					fmt.Printf("set vesting (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
 					continue
 				}
 
@@ -399,6 +400,21 @@ var msigCreateNextCmd = &cli.Command{
 				if err := writeProgress(); err != nil {
 					return err
 				}
+			}
+
+			act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
+			if err != nil {
+				fmt.Printf("could not get actor on chain for %s: %s", job.ActorID, err)
+				continue
+			}
+			reqamt, err := types.ParseFIL(job.Params.Amount)
+			if err != nil {
+				return fmt.Errorf("failed to parse amount in job %s: %w", jobStr(job), err)
+			}
+
+			if types.BigCmp(act.Balance, types.BigInt(reqamt)) < 0 {
+				fmt.Printf("Need to send funds to %s: Balance %s < %s\n", jobStr(job), act.Balance, reqamt)
+				continue
 			}
 
 			if job.FundsLocked && job.Params.MultisigM != 1 && !job.SetThresholdCID.Defined() {
@@ -813,4 +829,97 @@ func readYes() bool {
 	}
 	fmt.Printf("YOU TYPED: %q\n", string(line))
 	return string(line) == "YES"
+}
+
+var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
+	Name:        "audit-sends",
+	Description: "output a csv of all the proposed sends for funding wallets",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "source",
+			Usage: "source account to audit sends from",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		sourceAddr, err := address.NewFromString(cctx.String("source"))
+		if err != nil {
+			return fmt.Errorf("failed to parse 'source' address: %w", err)
+		}
+
+		act, err := api.StateGetActor(ctx, sourceAddr, types.EmptyTSK)
+		if err != nil {
+			return err
+		}
+
+		data, err := api.ChainReadObj(ctx, act.Head)
+		if err != nil {
+			return err
+		}
+
+		var msigst msig.State
+		if err := msigst.UnmarshalCBOR(bytes.NewReader(data)); err != nil {
+			return err
+		}
+
+		ptxns, err := lcli.GetMultisigPending(ctx, api, msigst.PendingTxns)
+		if err != nil {
+			return err
+		}
+
+		type txnTracker struct {
+			Txn *msig.Transaction
+			ID  int64
+		}
+
+		bytarget := make(map[address.Address]txnTracker)
+		for id, txn := range ptxns {
+			bytarget[txn.To] = txnTracker{
+				Txn: txn,
+				ID:  id,
+			}
+		}
+
+		fmt.Printf("WalletHash,WalletID,Signers,TxnID,Value\n")
+		for _, job := range msd.Jobs {
+			var sigs []string
+			for _, s := range msigst.Signers {
+				sigs = append(sigs, s.String())
+			}
+
+			tid := int64(-1)
+			value := abi.NewTokenAmount(0)
+			txn, ok := bytarget[job.ActorID]
+			if ok {
+				tid = txn.ID
+				value = txn.Txn.Value
+			}
+			fmt.Printf("%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, strings.Join(sigs, ":"), tid, value)
+		}
+
+		return nil
+	},
 }
