@@ -69,8 +69,9 @@ type MsigCreationProgress struct {
 }
 
 type MsigCreationData struct {
-	Jobs    []*MsigCreationProgress
-	Creator address.Address
+	Jobs       []*MsigCreationProgress
+	Creator    address.Address
+	SkipRemove bool
 }
 
 var createMsigsCmd = &cli.Command{
@@ -151,6 +152,10 @@ var msigCreateStartCmd = &cli.Command{
 			Name:  "creator",
 			Usage: "address to use as the creator and controller for the entire setup process",
 		},
+		&cli.BoolFlag{
+			Name:  "skip-remove",
+			Usage: "set to skip removal of initial control address during setup flow",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
@@ -182,7 +187,8 @@ var msigCreateStartCmd = &cli.Command{
 		}
 
 		cd := &MsigCreationData{
-			Creator: createAddr,
+			Creator:    createAddr,
+			SkipRemove: cctx.Bool("skip-remove"),
 		}
 
 		for _, p := range params {
@@ -447,7 +453,7 @@ var msigCreateNextCmd = &cli.Command{
 				}
 			}
 
-			if job.ThresholdSet && !job.RemoveControlCID.Defined() {
+			if job.ThresholdSet && !job.RemoveControlCID.Defined() && !msd.SkipRemove {
 				params := &msig.RemoveSignerParams{
 					Signer: msd.Creator,
 				}
@@ -480,7 +486,7 @@ var msigCreateNextCmd = &cli.Command{
 				}
 			}
 
-			if job.ControlChanged {
+			if job.ControlChanged || msd.SkipRemove {
 				// nothing else to do, this ones complete
 				progress++
 				job.Complete = true
@@ -903,7 +909,7 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 			}
 		}
 
-		fmt.Printf("WalletHash,WalletID,Signers,TxnID,Value\n")
+		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,TxnID,Value\n")
 		for _, job := range msd.Jobs {
 			var sigs []string
 			for _, s := range msigst.Signers {
@@ -917,7 +923,12 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 				tid = txn.ID
 				value = txn.Txn.Value
 			}
-			fmt.Printf("%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, strings.Join(sigs, ":"), tid, value)
+			act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
+			if err != nil {
+				return fmt.Errorf("failed to get actor %s: %w", job.ActorID, err)
+			}
+
+			fmt.Printf("%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, strings.Join(sigs, ":"), types.FIL(act.Balance), tid, value)
 		}
 
 		return nil
