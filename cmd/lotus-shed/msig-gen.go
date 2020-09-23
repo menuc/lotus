@@ -15,6 +15,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/ipfs/go-cid"
+	"github.com/minio/blake2b-simd"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
 
@@ -112,6 +113,8 @@ var msigCreationStatusCmd = &cli.Command{
 		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
 			return err
 		}
+
+		// TODO: this command is WIP, needs work
 
 		for _, job := range msd.Jobs {
 			if job.CreateCID != cid.Undef {
@@ -701,6 +704,15 @@ func addressesAreSame(s1, s2 []address.Address) bool {
 var msigCreateFillCmd = &cli.Command{
 	Name:        "fill",
 	Description: "fill wallets with appropriate funds from source funding pool",
+	Subcommands: []*cli.Command{
+		msigCreateFillProposeCmd,
+		msigCreateFillApproveCmd,
+	},
+}
+
+var msigCreateFillProposeCmd = &cli.Command{
+	Name:        "propose",
+	Description: "propose transactions to fill wallets with appropriate funds from source funding pool",
 	Flags: []cli.Flag{
 		&cli.StringFlag{
 			Name:  "source",
@@ -823,6 +835,127 @@ var msigCreateFillCmd = &cli.Command{
 				return fmt.Errorf("failed to write progress after sending funds: %w", err)
 			}
 		}
+		return nil
+	},
+}
+
+type approvalInfo struct {
+	TxnID    int
+	To       address.Address
+	Proposer address.Address
+	Value    abi.TokenAmount
+}
+
+var msigCreateFillApproveCmd = &cli.Command{
+	Name:        "approve",
+	Description: "approve transactions to fill wallets with appropriate funds from source funding pool",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "source",
+			Usage: "source account to pull funds from",
+		},
+		&cli.StringFlag{
+			Name:  "signer",
+			Usage: "address of signer for the 'source' multisig",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		lines, err := csv.NewReader(fi).ReadAll()
+		if err != nil {
+			return fmt.Errorf("failed to read tx audit file: %w", err)
+		}
+
+		var toApprove []approvalInfo
+		for i, l := range lines[1:] {
+			v, err := strconv.Atoi(l[5])
+			if err != nil {
+				return fmt.Errorf("failed to parse txn id on row %d: %w", i, err)
+			}
+			proposer, err := address.NewFromString(l[4])
+			if err != nil {
+				return fmt.Errorf("failed to parse proposer from input row %d: %w", i, err)
+			}
+
+			amount, err := types.ParseFIL(l[6])
+			if err != nil {
+				return fmt.Errorf("failed to parse amount from input row %d: %w", i, err)
+			}
+			target, err := address.NewFromString(l[1])
+			if err != nil {
+				return fmt.Errorf("failed to parse multisig address on row %d: %w", i, err)
+			}
+
+			toApprove = append(toApprove, approvalInfo{
+				TxnID:    v,
+				To:       target,
+				Proposer: proposer,
+				Value:    big.Int(amount),
+			})
+		}
+		fi.Close()
+
+		sourceAddr, err := address.NewFromString(cctx.String("source"))
+		if err != nil {
+			return fmt.Errorf("failed to parse 'source' address: %w", err)
+		}
+
+		signerAddr, err := address.NewFromString(cctx.String("signer"))
+		if err != nil {
+			return fmt.Errorf("failed to parse 'signer' address: %w", err)
+		}
+
+		for _, txn := range toApprove {
+			phash, err := msig.ComputeProposalHash(&msig.Transaction{
+				To:       txn.To,
+				Value:    txn.Value,
+				Approved: []address.Address{txn.Proposer},
+			}, blake2b.Sum256)
+			if err != nil {
+				return fmt.Errorf("failed to compute proposal hash: %w", err)
+			}
+
+			params := &msig.TxnIDParams{
+				ID:           msig.TxnID(txn.TxnID),
+				ProposalHash: phash,
+			}
+
+			buf := new(bytes.Buffer)
+			if err := params.MarshalCBOR(buf); err != nil {
+				return err
+			}
+
+			msg := &types.Message{
+				To:     sourceAddr,
+				From:   signerAddr,
+				Method: builtin.MethodsMultisig.Approve,
+				Params: buf.Bytes(),
+			}
+
+			sm, err := api.MpoolPushMessage(ctx, msg, nil)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("Approval for txn %d sent in %s\n", txn.TxnID, sm.Cid())
+		}
+
 		return nil
 	},
 }
@@ -970,7 +1103,7 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 			}
 		}
 
-		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,TxnID,Value\n")
+		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,Proposer,TxnID,Value\n")
 		for _, job := range msd.Jobs {
 
 			tid := int64(-1)
@@ -985,7 +1118,7 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 				return fmt.Errorf("failed to get actor %s: %w", job.ActorID, err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), tid, value)
+			fmt.Printf("%s,%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), txn.Txn.Approved[0], tid, value)
 		}
 
 		return nil
