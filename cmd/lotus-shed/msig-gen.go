@@ -84,6 +84,7 @@ var createMsigsCmd = &cli.Command{
 		msigCreateVerifyCmd,
 		msigCreateFillCmd,
 		msigCreateAuditsCmd,
+		msigCreateOutputCsvCmd,
 	},
 }
 
@@ -445,7 +446,7 @@ var msigCreateNextCmd = &cli.Command{
 			if job.SetThresholdCID.Defined() && !job.ThresholdSet {
 				fmt.Println("finding set threshold receipt for ", job.Params.Name)
 				if err := checkProposeReceipt(ctx, api, job.SetThresholdCID); err != nil {
-					fmt.Printf("set threshold (%s %s %s) not complete: %s", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+					fmt.Printf("set threshold (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
 					continue
 				}
 
@@ -797,7 +798,7 @@ var msigCreateFillProposeCmd = &cli.Command{
 				fmt.Printf("Balance is sufficient, continuing...\n\n")
 				continue
 			}
-			fmt.Printf("\n\tAbout to send %s to %s (%s)\nPlease confirm by typing YES\n", toSend, addr, job.ActorID)
+			fmt.Printf("\n\tAbout to send %s to %s (%s)\nPlease confirm by typing YES\n", types.FIL(toSend), addr, job.ActorID)
 			if !readYes() {
 				fmt.Println("aborting...")
 				return nil
@@ -1156,4 +1157,33 @@ func getMsigState(ctx context.Context, api api.FullNode, addr address.Address) (
 	}
 
 	return &msigst, act, nil
+}
+
+var msigCreateOutputCsvCmd = &cli.Command{
+	Name:        "output-csv",
+	Description: "generate output csv with created addresses and message ID",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		fmt.Println("Name,Entity,Hash,Amount,VestingMonths,MultisigM,MultisigN,Addresses,ActorID,MessageID")
+		for _, job := range msd.Jobs {
+			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%s,%s,%s\n", job.Params.Name, job.Params.Entity, job.Params.Hash, job.Params.Amount, job.Params.VestingMonths, job.Params.MultisigM, job.Params.MultisigN, addrsToColonString(job.Params.Addresses), job.ActorID, job.CreateCID)
+		}
+		return nil
+	},
 }
