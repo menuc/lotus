@@ -902,9 +902,14 @@ var msigCreateFillApproveCmd = &cli.Command{
 				return fmt.Errorf("failed to parse multisig address on row %d: %w", i, err)
 			}
 
+			idaddr, err := api.StateLookupID(ctx, target, types.EmptyTSK)
+			if err != nil {
+				return err
+			}
+
 			toApprove = append(toApprove, approvalInfo{
 				TxnID:    v,
-				To:       target,
+				To:       idaddr,
 				Proposer: proposer,
 				Value:    big.Int(amount),
 			})
