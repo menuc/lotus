@@ -937,9 +937,11 @@ var msigCreateFillApproveCmd = &cli.Command{
 				return fmt.Errorf("failed to compute proposal hash: %w", err)
 			}
 
+			_ = phash
+			// TODO: figure out exactly how the proposal hash stuff works
 			params := &msig.TxnIDParams{
-				ID:           msig.TxnID(txn.TxnID),
-				ProposalHash: phash,
+				ID: msig.TxnID(txn.TxnID),
+				//ProposalHash: phash,
 			}
 
 			buf := new(bytes.Buffer)
