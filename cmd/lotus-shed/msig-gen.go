@@ -193,6 +193,7 @@ var msigCreateStartCmd = &cli.Command{
 				Params:    p,
 				CreateCID: createCid,
 			})
+			fmt.Printf("created multisig for %s in %s\n", p.Hash, createCid)
 		}
 
 		fi, err := os.Create("msig-creation-progress.json")
@@ -248,12 +249,17 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 			return nil, fmt.Errorf("failed to parse msigN field of row %d: %w", i, err)
 		}
 
+		addrDups := make(map[address.Address]bool)
 		var addresses []address.Address
 		for j, a := range strings.Split(r[7], ":") {
-			addr, err := address.NewFromString(a)
+			addr, err := address.NewFromString(strings.TrimSpace(a))
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse address %d on row %d: %w", j, i, err)
 			}
+			if addrDups[addr] {
+				return nil, fmt.Errorf("address %s in row %d is duplicated", addr, i)
+			}
+			addrDups[addr] = true
 			addresses = append(addresses, addr)
 		}
 		if len(addresses) != msigN {
@@ -1305,7 +1311,12 @@ var msigCreateAuditCreatesCmd = &cli.Command{
 				return fmt.Errorf("failed to lookup actor ID: %w", err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%s\n", job.Params.Hash, job.ActorID, actId, act.Balance, st.InitialBalance, st.StartEpoch, st.UnlockDuration, addrsToColonString(st.Signers))
+			kaddrs, err := toPublicKeys(ctx, api, st.Signers)
+			if err != nil {
+				return fmt.Errorf("failed to lookup public keys for signers: %w", err)
+			}
+
+			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%s\n", job.Params.Hash, job.ActorID, actId, act.Balance, st.InitialBalance, st.StartEpoch, st.UnlockDuration, addrsToColonString(kaddrs))
 
 		}
 		return nil
@@ -1559,6 +1570,18 @@ var msigCreateRemoveAdminsProposeCmd = &cli.Command{
 
 		return nil
 	},
+}
+
+func toPublicKeys(ctx context.Context, api api.FullNode, addrs []address.Address) ([]address.Address, error) {
+	var out []address.Address
+	for _, a := range addrs {
+		k, err := api.StateAccountKey(ctx, a, types.EmptyTSK)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, nil
 }
 
 func getProgressWriter(fname string, msd *MsigCreationData) func() error {
