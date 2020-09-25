@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"sort"
 	"strconv"
@@ -67,13 +67,16 @@ type MsigCreationProgress struct {
 	Complete bool
 
 	SentFunds cid.Cid
+
+	AdminRemovals map[string]cid.Cid
 }
 
 type MsigCreationData struct {
-	Jobs       []*MsigCreationProgress
-	Creator    address.Address
-	AdminAux   []address.Address
-	SkipRemove bool // TODO: deleteme
+	Jobs              []*MsigCreationProgress
+	Creator           address.Address
+	AdminAux          []address.Address
+	SkipRemove        bool // TODO: deleteme
+	VestingStartEpoch abi.ChainEpoch
 }
 
 var createMsigsCmd = &cli.Command{
@@ -87,6 +90,7 @@ var createMsigsCmd = &cli.Command{
 		msigCreateFillCmd,
 		msigCreateAuditsCmd,
 		msigCreateOutputCsvCmd,
+		msigCreateRemoveAdminsCmd,
 	},
 }
 
@@ -94,8 +98,9 @@ var msigCreateStartCmd = &cli.Command{
 	Name:        "start",
 	Description: "start of multisig accounts creation, parses initial csv input and sends creation messages for each, recording the message cid in the output file",
 	Flags: []cli.Flag{
-		&cli.Uint64Flag{
-			Name: "vesting-start",
+		&cli.Int64Flag{
+			Name:  "vesting-start",
+			Usage: "epoch at which vesting will start for the created wallets",
 		},
 		&cli.StringFlag{
 			Name:  "creator",
@@ -155,8 +160,9 @@ var msigCreateStartCmd = &cli.Command{
 		}
 
 		cd := &MsigCreationData{
-			Creator:  createAddr,
-			AdminAux: adminAux,
+			Creator:           createAddr,
+			AdminAux:          adminAux,
+			VestingStartEpoch: abi.ChainEpoch(cctx.Int64("vesting-start")),
 		}
 
 		for _, p := range params {
@@ -285,19 +291,7 @@ var msigCreateCheckCreationCmd = &cli.Command{
 			return err
 		}
 
-		writeProgress := func() error {
-			nfi, err := os.Create(cctx.Args().First())
-			if err != nil {
-				return fmt.Errorf("failed to open file: %w", err)
-			}
-			defer nfi.Close()
-
-			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
-				return fmt.Errorf("failed to write progress out to a file: %w", err)
-			}
-
-			return nil
-		}
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
 		var complete int
 		for _, job := range msd.Jobs {
@@ -372,19 +366,7 @@ var msigCreateSetVestingProposeCmd = &cli.Command{
 			return err
 		}
 
-		writeProgress := func() error {
-			nfi, err := os.Create(cctx.Args().First())
-			if err != nil {
-				return fmt.Errorf("failed to open file: %w", err)
-			}
-			defer nfi.Close()
-
-			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
-				return fmt.Errorf("failed to write progress out to a file: %w", err)
-			}
-
-			return nil
-		}
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
 		for _, job := range msd.Jobs {
 			if job.ActorID == address.Undef {
@@ -399,7 +381,7 @@ var msigCreateSetVestingProposeCmd = &cli.Command{
 				return xerrors.Errorf("failed to parse fil amount: %w", err)
 			}
 			params := &msig.LockBalanceParams{
-				StartEpoch:     0,
+				StartEpoch:     msd.VestingStartEpoch,
 				UnlockDuration: abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths),
 				Amount:         big.Int(famt),
 			}
@@ -442,19 +424,7 @@ var msigCreateSetVestingCheckCmd = &cli.Command{
 			return err
 		}
 
-		writeProgress := func() error {
-			nfi, err := os.Create(cctx.Args().First())
-			if err != nil {
-				return fmt.Errorf("failed to open file: %w", err)
-			}
-			defer nfi.Close()
-
-			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
-				return fmt.Errorf("failed to write progress out to a file: %w", err)
-			}
-
-			return nil
-		}
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
 		for _, job := range msd.Jobs {
 			if job.SetVestingCID == cid.Undef {
@@ -649,19 +619,7 @@ var msigCreateNextCmd = &cli.Command{
 			return err
 		}
 
-		writeProgress := func() error {
-			nfi, err := os.Create(cctx.Args().First())
-			if err != nil {
-				return fmt.Errorf("failed to open file: %w", err)
-			}
-			defer nfi.Close()
-
-			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
-				return fmt.Errorf("failed to write progress out to a file: %w", err)
-			}
-
-			return nil
-		}
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
 		var progress int
 		for _, job := range msd.Jobs {
@@ -1082,19 +1040,7 @@ var msigCreateFillProposeCmd = &cli.Command{
 			return err
 		}
 
-		writeProgress := func() error {
-			nfi, err := os.Create(cctx.Args().First())
-			if err != nil {
-				return fmt.Errorf("failed to open file: %w", err)
-			}
-			defer nfi.Close()
-
-			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
-				return fmt.Errorf("failed to write progress out to a file: %w", err)
-			}
-
-			return nil
-		}
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
 		sourceAddr, err := address.NewFromString(cctx.String("source"))
 		if err != nil {
@@ -1304,16 +1250,6 @@ var msigCreateFillApproveCmd = &cli.Command{
 	},
 }
 
-func readYes() bool {
-	sc := bufio.NewReader(os.Stdin)
-	line, _, err := sc.ReadLine()
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("YOU TYPED: %q\n", string(line))
-	return string(line) == "YES"
-}
-
 var msigCreateAuditsCmd = &cli.Command{
 	Name:        "audit",
 	Description: "a collection of commands for auditing the process",
@@ -1439,20 +1375,22 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 
 		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,Proposer,TxnID,Value\n")
 		for _, job := range msd.Jobs {
-
 			tid := int64(-1)
 			value := abi.NewTokenAmount(0)
+			var proposer address.Address
 			txn, ok := bytarget[job.ActorID]
 			if ok {
 				tid = txn.ID
 				value = txn.Txn.Value
+				proposer = txn.Txn.Approved[0]
 			}
+
 			act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
 			if err != nil {
 				return fmt.Errorf("failed to get actor %s: %w", job.ActorID, err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), txn.Txn.Approved[0], tid, types.FIL(value))
+			fmt.Printf("%s,%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), proposer, tid, types.FIL(value))
 		}
 
 		return nil
@@ -1522,4 +1460,106 @@ func loadMsd(fname string) (*MsigCreationData, error) {
 	}
 
 	return &msd, nil
+}
+
+var msigCreateRemoveAdminsCmd = &cli.Command{
+	Name: "remove-admins",
+	Subcommands: []*cli.Command{
+		msigCreateRemoveAdminsProposeCmd,
+	},
+}
+
+var msigCreateRemoveAdminsProposeCmd = &cli.Command{
+	Name:        "propose",
+	Description: "proposes removal of admin addresses from wallets",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		msd, err := loadMsd(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
+
+		// First, ensure the wallets have the other addresses set on them properly
+		for _, job := range msd.Jobs {
+			mstate, _, err := getMsigState(ctx, api, job.ActorID)
+			if err != nil {
+				return err
+			}
+
+			signers := make(map[address.Address]bool)
+			for _, s := range mstate.Signers {
+				signers[s] = true
+			}
+
+			for _, expSig := range job.Params.Addresses {
+				idAddr, err := api.StateLookupID(ctx, expSig, types.EmptyTSK)
+				if err != nil {
+					return err
+				}
+
+				if !signers[idAddr] {
+					return fmt.Errorf("wallet %s (%s) should have %s as a signer but does not", job.ActorID, jobStr(job), expSig)
+				}
+			}
+		}
+
+		for _, job := range msd.Jobs {
+			if job.AdminRemovals == nil {
+				job.AdminRemovals = make(map[string]cid.Cid)
+			}
+
+			for _, a := range msd.AdminAux {
+				params := &msig.RemoveSignerParams{Signer: a}
+
+				propCid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
+				if err != nil {
+					return fmt.Errorf("failed to propose removal: %w", err)
+				}
+
+				job.AdminRemovals[a.String()] = propCid
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			}
+
+			params := &msig.RemoveSignerParams{Signer: msd.Creator}
+
+			propCid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
+			if err != nil {
+				return fmt.Errorf("failed to propose removal: %w", err)
+			}
+
+			job.AdminRemovals[msd.Creator.String()] = propCid
+			if err := writeProgress(); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	},
+}
+
+func getProgressWriter(fname string, msd *MsigCreationData) func() error {
+	return func() error {
+		data, err := json.Marshal(msd)
+		if err != nil {
+			return fmt.Errorf("failed to marshal data: %w", err)
+		}
+
+		return ioutil.WriteFile(fname, data, 644)
+	}
 }
