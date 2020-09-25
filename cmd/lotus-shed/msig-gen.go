@@ -72,76 +72,21 @@ type MsigCreationProgress struct {
 type MsigCreationData struct {
 	Jobs       []*MsigCreationProgress
 	Creator    address.Address
-	SkipRemove bool
+	AdminAux   []address.Address
+	SkipRemove bool // TODO: deleteme
 }
 
 var createMsigsCmd = &cli.Command{
 	Name: "create-msigs",
 	Subcommands: []*cli.Command{
 		msigCreateStartCmd,
-		msigCreationStatusCmd,
+		msigCreateCheckCreationCmd,
+		msigCreateSetVestingCmd,
 		msigCreateNextCmd,
 		msigCreateVerifyCmd,
 		msigCreateFillCmd,
 		msigCreateAuditsCmd,
 		msigCreateOutputCsvCmd,
-	},
-}
-
-var msigCreationStatusCmd = &cli.Command{
-	Name:        "status",
-	Description: "check status of multisig creation batch job",
-	Flags:       []cli.Flag{},
-	Action: func(cctx *cli.Context) error {
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass input file")
-		}
-
-		api, closer, err := lcli.GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-
-		defer closer()
-		ctx := lcli.ReqContext(cctx)
-
-		fi, err := os.Open(cctx.Args().First())
-		if err != nil {
-			return err
-		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		// TODO: this command is WIP, needs work
-
-		for _, job := range msd.Jobs {
-			if job.CreateCID != cid.Undef {
-				r, err := api.StateGetReceipt(ctx, job.CreateCID, types.EmptyTSK)
-				if err != nil {
-					return fmt.Errorf("failed to get receipt: %w", err)
-				} else {
-					if r == nil {
-						fmt.Printf("no receipt found yet for %s\n", job.CreateCID)
-					} else {
-						if r.ExitCode != 0 {
-							fmt.Printf("creation job failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
-						} else {
-							var er iact.ExecReturn
-							if err := er.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
-								return xerrors.Errorf("return value of create message failed to parse: %w", err)
-							}
-
-							fmt.Printf("actor create successful: %s %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, er.RobustAddress)
-						}
-					}
-				}
-			}
-		}
-
-		return nil
 	},
 }
 
@@ -156,9 +101,17 @@ var msigCreateStartCmd = &cli.Command{
 			Name:  "creator",
 			Usage: "address to use as the creator and controller for the entire setup process",
 		},
+		&cli.StringFlag{
+			Name:  "admin-aux",
+			Usage: "additional admin keys for setting up wallets with",
+		},
 		&cli.BoolFlag{
 			Name:  "skip-remove",
 			Usage: "set to skip removal of initial control address during setup flow",
+		},
+		&cli.BoolFlag{
+			Name:  "only-admin-keys",
+			Usage: "only insert admin keys during initial creation",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -185,18 +138,39 @@ var msigCreateStartCmd = &cli.Command{
 			return fmt.Errorf("must specify creator address through flag")
 		}
 
+		var adminAux []address.Address
+		if aastr := cctx.String("admin-aux"); aastr != "" {
+			for _, a := range strings.Split(aastr, ",") {
+				auxAddr, err := address.NewFromString(a)
+				if err != nil {
+					return fmt.Errorf("failed to parse aux address: %w", err)
+				}
+				adminAux = append(adminAux, auxAddr)
+			}
+		}
+
 		params, err := parseCreateParams(cctx.Args().First())
 		if err != nil {
 			return err
 		}
 
 		cd := &MsigCreationData{
-			Creator:    createAddr,
-			SkipRemove: cctx.Bool("skip-remove"),
+			Creator:  createAddr,
+			AdminAux: adminAux,
 		}
 
 		for _, p := range params {
-			createCid, err := api.MsigCreate(ctx, 1, append(p.Addresses, createAddr), 0, types.NewInt(0), createAddr, types.NewInt(0))
+			controls := []address.Address{createAddr}
+
+			if len(adminAux) > 0 {
+				controls = append(controls, adminAux...)
+			}
+
+			if !cctx.Bool("only-admin-keys") {
+				controls = append(controls, p.Addresses...)
+			}
+
+			createCid, err := api.MsigCreate(ctx, uint64(1+len(adminAux)), controls, 0, types.NewInt(0), createAddr, types.NewInt(0))
 			if err != nil {
 				return xerrors.Errorf("failed to create multisigs: %w", err)
 			}
@@ -289,11 +263,396 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 	return out, nil
 }
 
+var msigCreateCheckCreationCmd = &cli.Command{
+	Name:        "check-creation",
+	Description: "checks that the creations kicked off in 'start' were successful and records the results",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		writeProgress := func() error {
+			nfi, err := os.Create(cctx.Args().First())
+			if err != nil {
+				return fmt.Errorf("failed to open file: %w", err)
+			}
+			defer nfi.Close()
+
+			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
+				return fmt.Errorf("failed to write progress out to a file: %w", err)
+			}
+
+			return nil
+		}
+
+		var complete int
+		for _, job := range msd.Jobs {
+			if job.ActorID != address.Undef {
+				complete++
+				continue
+			}
+
+			fmt.Println("finding creation receipt for ", job.Params.Name)
+			r, err := api.StateGetReceipt(ctx, job.CreateCID, types.EmptyTSK)
+			if err != nil {
+				log.Warnf("no receipt found for %s", job.CreateCID)
+			} else {
+				if r != nil {
+					if r.ExitCode != 0 {
+						fmt.Printf("creation job failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
+					} else {
+						var er iact.ExecReturn
+						if err := er.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
+							return xerrors.Errorf("return value of create message failed to parse: %w", err)
+						}
+
+						fmt.Printf("actor create successful: %s %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, er.RobustAddress)
+						job.ActorID = er.RobustAddress
+						if err := writeProgress(); err != nil {
+							return err
+						}
+						complete++
+					}
+				} else {
+					fmt.Printf("creation message for %s hasnt made it into the chain yet\n", job.Params.Custodian)
+				}
+			}
+
+		}
+
+		fmt.Printf("%d / %d Complete.\n", complete, len(msd.Jobs))
+
+		return nil
+	},
+}
+
+var msigCreateSetVestingCmd = &cli.Command{
+	Name:        "set-vesting",
+	Description: "set the vesting schedule of wallets",
+	Subcommands: []*cli.Command{
+		msigCreateSetVestingProposeCmd,
+		msigCreateSetVestingCheckCmd,
+		msigCreateSetVestingApproveCmd,
+	},
+}
+
+var msigCreateSetVestingProposeCmd = &cli.Command{
+	Name:        "propose",
+	Description: "propose the vesting schedule of wallets",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		writeProgress := func() error {
+			nfi, err := os.Create(cctx.Args().First())
+			if err != nil {
+				return fmt.Errorf("failed to open file: %w", err)
+			}
+			defer nfi.Close()
+
+			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
+				return fmt.Errorf("failed to write progress out to a file: %w", err)
+			}
+
+			return nil
+		}
+
+		for _, job := range msd.Jobs {
+			if job.ActorID == address.Undef {
+				fmt.Printf("actor creation not yet complete for %s. Please run 'check-creation'\n", jobStr(job))
+				return nil
+			}
+		}
+
+		for _, job := range msd.Jobs {
+			famt, err := types.ParseFIL(job.Params.Amount)
+			if err != nil {
+				return xerrors.Errorf("failed to parse fil amount: %w", err)
+			}
+			params := &msig.LockBalanceParams{
+				StartEpoch:     0,
+				UnlockDuration: abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths),
+				Amount:         big.Int(famt),
+			}
+
+			lmcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.LockBalance)
+			if err != nil {
+				return fmt.Errorf("failed to propose lock funds operation on %s: %w", jobStr(job), err)
+			}
+
+			job.SetVestingCID = lmcid
+			if err := writeProgress(); err != nil {
+				return err
+			}
+			fmt.Printf("proposed funds locking for %s in %s\n", job.Params.Name, lmcid)
+		}
+
+		return nil
+	},
+}
+
+var msigCreateSetVestingCheckCmd = &cli.Command{
+	Name:        "check",
+	Description: "check that the proposals for set-vesting have landed",
+	Flags:       []cli.Flag{},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		var msd MsigCreationData
+		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+			return err
+		}
+
+		fi.Close()
+
+		writeProgress := func() error {
+			nfi, err := os.Create(cctx.Args().First())
+			if err != nil {
+				return fmt.Errorf("failed to open file: %w", err)
+			}
+			defer nfi.Close()
+
+			if err := json.NewEncoder(nfi).Encode(&msd); err != nil {
+				return fmt.Errorf("failed to write progress out to a file: %w", err)
+			}
+
+			return nil
+		}
+
+		for _, job := range msd.Jobs {
+			if job.SetVestingCID == cid.Undef {
+				fmt.Printf("set vesting operation not yet proposed for %s. Please run 'set-vesting propose'", jobStr(job))
+				return nil
+			}
+		}
+
+		fmt.Printf("Hash,SetVestingCID,Applied,ActorID,TxnID,Error\n")
+		for _, job := range msd.Jobs {
+			pr, err := checkProposeReceipt(ctx, api, job.SetVestingCID)
+			if err != nil {
+				errstr := fmt.Sprintf("set vesting not complete: %s", err)
+				fmt.Printf("%s,%s,false,%s,-1,%s\n", job.Params.Hash, job.SetVestingCID, job.ActorID, errstr)
+				continue
+			}
+
+			if pr.Applied {
+				fmt.Printf("%s,%s,true,%s,-1,\n", job.Params.Hash, job.ActorID, job.SetVestingCID)
+				job.FundsLocked = true
+				if err := writeProgress(); err != nil {
+					return err
+				}
+			} else {
+				if len(msd.AdminAux) > 0 {
+					mstate, _, err := getMsigState(ctx, api, job.ActorID)
+					if err != nil {
+						return fmt.Errorf("failed to get actor state for %s: %w", job.ActorID, err)
+					}
+
+					if mstate.UnlockDuration != 0 {
+						// Success!
+						// Note: this is a pretty crappy metric for 'success',
+						// but we have multiple auditing steps in here anyways,
+						// so its good enough
+
+						job.FundsLocked = true
+						if err := writeProgress(); err != nil {
+							return err
+						}
+
+						fmt.Printf("%s,%s,true,%s,%d,\n", job.Params.Hash, job.SetVestingCID, job.ActorID, pr.TxnID)
+						continue
+					}
+
+					fmt.Printf("%s,%s,false,%s,%d,\n", job.Params.Hash, job.SetVestingCID, job.ActorID, pr.TxnID)
+					continue
+				} else {
+					errstr := "funds locking for failed to apply but shouldnt have any required approvals"
+					fmt.Printf("%s,%s,false,%s,-1,%s\n", job.Params.Hash, job.SetVestingCID, job.ActorID, errstr)
+					continue
+				}
+			}
+
+		}
+
+		return nil
+	},
+}
+
+var msigCreateSetVestingApproveCmd = &cli.Command{
+	Name:        "approve",
+	Description: "approve the vesting schedule of wallets",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "admin-key",
+			Usage: "specify admin key to approve set vesting with",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		fi, err := os.Open(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		type setVestingRow struct {
+			Hash          string
+			SetVestingCID cid.Cid
+			Applied       bool
+			ActorID       address.Address
+			TxnID         msig.TxnID
+			Error         string
+		}
+
+		rows, err := csv.NewReader(fi).ReadAll()
+		if err != nil {
+			return err
+		}
+
+		var svrows []setVestingRow
+		for _, r := range rows[1:] {
+
+			svc, err := cid.Decode(r[1])
+			if err != nil {
+				return err
+			}
+
+			var applied bool
+			if r[2] == "true" {
+				applied = true
+			} else if r[2] != "false" {
+				return fmt.Errorf("expected column three to be 'true' or 'false'")
+			}
+
+			actId, err := address.NewFromString(r[3])
+			if err != nil {
+				return fmt.Errorf("failed to parse actor ID from input csv: %w", err)
+			}
+
+			txnid, err := strconv.ParseInt(r[4], 10, 64)
+			if err != nil {
+				return fmt.Errorf("failed to parse txnid: %w", err)
+			}
+
+			svrows = append(svrows, setVestingRow{
+				Hash:          r[0],
+				SetVestingCID: svc,
+				Applied:       applied,
+				ActorID:       actId,
+				TxnID:         msig.TxnID(txnid),
+				Error:         r[5],
+			})
+		}
+
+		adminKey, err := address.NewFromString(cctx.String("admin-key"))
+		if err != nil {
+			return fmt.Errorf("failed to parse admin-key: %w", err)
+		}
+
+		for _, svr := range svrows {
+			params := &msig.TxnIDParams{
+				ID: svr.TxnID,
+			}
+
+			buf := new(bytes.Buffer)
+			if err := params.MarshalCBOR(buf); err != nil {
+				return err
+			}
+
+			msg := &types.Message{
+				To:     svr.ActorID,
+				From:   adminKey,
+				Method: builtin.MethodsMultisig.Approve,
+				Params: buf.Bytes(),
+			}
+
+			sm, err := api.MpoolPushMessage(ctx, msg, nil)
+			if err != nil {
+				return fmt.Errorf("mpool push message failed: %w", err)
+			}
+
+			fmt.Printf("approved txn %d on %s in msg %s\n", svr.TxnID, svr.ActorID, sm.Cid())
+		}
+
+		return nil
+	},
+}
+
 var msigCreateNextCmd = &cli.Command{
 	Name:        "next",
 	Description: "perform next required processing for multisig creation",
 	Flags:       []cli.Flag{},
 	Action: func(cctx *cli.Context) error {
+		return fmt.Errorf("this method is deprecated, i'm only keeping it around to copy bits out of it into other commands")
+
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
 		}
@@ -391,8 +750,14 @@ var msigCreateNextCmd = &cli.Command{
 
 			if job.SetVestingCID.Defined() && !job.FundsLocked {
 				fmt.Println("finding funds locking receipt for ", job.Params.Name)
-				if err := checkProposeReceipt(ctx, api, job.SetVestingCID); err != nil {
+				pr, err := checkProposeReceipt(ctx, api, job.SetVestingCID)
+				if err != nil {
 					fmt.Printf("set vesting (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+					continue
+				}
+
+				if !pr.Applied {
+					fmt.Printf("set vesting (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, "transaction not applied")
 					continue
 				}
 
@@ -445,8 +810,14 @@ var msigCreateNextCmd = &cli.Command{
 
 			if job.SetThresholdCID.Defined() && !job.ThresholdSet {
 				fmt.Println("finding set threshold receipt for ", job.Params.Name)
-				if err := checkProposeReceipt(ctx, api, job.SetThresholdCID); err != nil {
+				pr, err := checkProposeReceipt(ctx, api, job.SetThresholdCID)
+				if err != nil {
 					fmt.Printf("set threshold (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
+					continue
+				}
+
+				if !pr.Applied {
+					fmt.Printf("set threshold (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, "transaction not applied")
 					continue
 				}
 
@@ -477,7 +848,13 @@ var msigCreateNextCmd = &cli.Command{
 			if !job.ControlChanged && job.RemoveControlCID.Defined() {
 				if job.Params.MultisigM == 1 {
 					fmt.Println("finding remove control address message for ", job.Params.Name)
-					if err := checkProposeReceipt(ctx, api, job.RemoveControlCID); err != nil {
+					pr, err := checkProposeReceipt(ctx, api, job.RemoveControlCID)
+					if err != nil {
+						fmt.Println("removing control address not complete")
+						continue
+					}
+
+					if !pr.Applied {
 						fmt.Println("removing control address not complete")
 						continue
 					}
@@ -505,34 +882,30 @@ var msigCreateNextCmd = &cli.Command{
 	},
 }
 
-func checkProposeReceipt(ctx context.Context, api api.FullNode, c cid.Cid) error {
+func checkProposeReceipt(ctx context.Context, api api.FullNode, c cid.Cid) (*msig.ProposeReturn, error) {
 	r, err := api.StateGetReceipt(ctx, c, types.EmptyTSK)
 	if err != nil {
-		return fmt.Errorf("finding receipt failed: %w", err)
+		return nil, fmt.Errorf("finding receipt failed: %w", err)
 	}
 
 	if r == nil {
-		return fmt.Errorf("message hasnt made it into the chain yet")
+		return nil, fmt.Errorf("message hasnt made it into the chain yet")
 	}
 
 	if r.ExitCode != 0 {
-		return fmt.Errorf("propose receipt had nonzero exitcode: %d", r.ExitCode)
+		return nil, fmt.Errorf("propose receipt had nonzero exitcode: %d", r.ExitCode)
 	}
 
 	var pr msig.ProposeReturn
 	if err := pr.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
-		return xerrors.Errorf("return value of %s failed to parse: %w", c, err)
+		return nil, xerrors.Errorf("return value of %s failed to parse: %w", c, err)
 	}
 
 	if pr.Code != 0 {
-		return fmt.Errorf("multisig operation failed: %d", pr.Code)
+		return nil, fmt.Errorf("multisig operation failed: %d", pr.Code)
 	}
 
-	if !pr.Applied {
-		return fmt.Errorf("operation not applied")
-	}
-
-	return nil
+	return &pr, nil
 }
 
 type cborMarshaler interface {
@@ -774,6 +1147,12 @@ var msigCreateFillProposeCmd = &cli.Command{
 		}
 
 		for _, job := range msd.Jobs {
+			if !job.FundsLocked {
+				return fmt.Errorf("vesting schedule not set for all wallets yet, please set vesting before sending funds")
+			}
+		}
+
+		for _, job := range msd.Jobs {
 			addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
 			if err != nil {
 				return fmt.Errorf("failed to lookup ID: %w", err)
@@ -798,11 +1177,8 @@ var msigCreateFillProposeCmd = &cli.Command{
 				fmt.Printf("Balance is sufficient, continuing...\n\n")
 				continue
 			}
-			fmt.Printf("\n\tAbout to send %s to %s (%s)\nPlease confirm by typing YES\n", types.FIL(toSend), addr, job.ActorID)
-			if !readYes() {
-				fmt.Println("aborting...")
-				return nil
-			}
+
+			fmt.Printf("\n\tAbout to send %s to %s (%s)\n", types.FIL(toSend), addr, job.ActorID)
 
 			if job.SentFunds.Defined() {
 				fmt.Println("funds already sent to target account: ", job.SentFunds)
@@ -1073,6 +1449,10 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 
 		fi.Close()
 
+		if cctx.String("source") == "" {
+			return fmt.Errorf("must specify source multisig to audit sends from")
+		}
+
 		sourceAddr, err := address.NewFromString(cctx.String("source"))
 		if err != nil {
 			return fmt.Errorf("failed to parse 'source' address: %w", err)
@@ -1126,7 +1506,7 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 				return fmt.Errorf("failed to get actor %s: %w", job.ActorID, err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), txn.Txn.Approved[0], tid, value)
+			fmt.Printf("%s,%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), txn.Txn.Approved[0], tid, types.FIL(value))
 		}
 
 		return nil
