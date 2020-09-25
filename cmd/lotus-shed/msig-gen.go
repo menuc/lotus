@@ -280,17 +280,10 @@ var msigCreateCheckCreationCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		writeProgress := func() error {
 			nfi, err := os.Create(cctx.Args().First())
@@ -374,17 +367,10 @@ var msigCreateSetVestingProposeCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		writeProgress := func() error {
 			nfi, err := os.Create(cctx.Args().First())
@@ -451,17 +437,10 @@ var msigCreateSetVestingCheckCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		writeProgress := func() error {
 			nfi, err := os.Create(cctx.Args().First())
@@ -665,17 +644,10 @@ var msigCreateNextCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		writeProgress := func() error {
 			nfi, err := os.Create(cctx.Args().First())
@@ -968,18 +940,13 @@ var msigCreateVerifyCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
-		if err != nil {
-			return err
-		}
-
 		curTs, err := api.ChainHead(ctx)
 		if err != nil {
 			return err
 		}
 
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+		msd, err := loadMsd(cctx.Args().First())
+		if err != nil {
 			return err
 		}
 
@@ -1110,17 +1077,10 @@ var msigCreateFillProposeCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		writeProgress := func() error {
 			nfi, err := os.Create(cctx.Args().First())
@@ -1379,17 +1339,10 @@ var msigCreateAuditCreatesCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		fmt.Printf("Hash,Address,ID,Balance,VestingAmount,VestingStart,VestingDuration,Signers\n")
 		for _, job := range msd.Jobs {
@@ -1437,17 +1390,10 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		if cctx.String("source") == "" {
 			return fmt.Errorf("must specify source multisig to audit sends from")
@@ -1550,17 +1496,10 @@ var msigCreateOutputCsvCmd = &cli.Command{
 			return fmt.Errorf("must pass input file")
 		}
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
 		if err != nil {
 			return err
 		}
-
-		var msd MsigCreationData
-		if err := json.NewDecoder(fi).Decode(&msd); err != nil {
-			return err
-		}
-
-		fi.Close()
 
 		fmt.Println("Name,Entity,Hash,Amount,VestingMonths,MultisigM,MultisigN,Addresses,ActorID,MessageID")
 		for _, job := range msd.Jobs {
@@ -1568,4 +1507,19 @@ var msigCreateOutputCsvCmd = &cli.Command{
 		}
 		return nil
 	},
+}
+
+func loadMsd(fname string) (*MsigCreationData, error) {
+	fi, err := os.Open(fname)
+	if err != nil {
+		return nil, err
+	}
+	defer fi.Close()
+
+	var msd MsigCreationData
+	if err := json.NewDecoder(fi).Decode(&msd); err != nil {
+		return nil, err
+	}
+
+	return &msd, nil
 }
