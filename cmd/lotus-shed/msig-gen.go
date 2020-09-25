@@ -165,6 +165,14 @@ var msigCreateStartCmd = &cli.Command{
 			VestingStartEpoch: abi.ChainEpoch(cctx.Int64("vesting-start")),
 		}
 
+		seenHashes := make(map[string]bool)
+		for _, p := range params {
+			if seenHashes[p.Hash] {
+				return fmt.Errorf("duplicate account in input: %s", p.Hash)
+			}
+			seenHashes[p.Hash] = true
+		}
+
 		for _, p := range params {
 			controls := []address.Address{createAddr}
 
