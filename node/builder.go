@@ -259,6 +259,7 @@ func Online() Option {
 			Override(new(vm.SyscallBuilder), vm.Syscalls),
 			Override(new(*store.ChainStore), modules.ChainStore),
 			Override(new(*stmgr.StateManager), stmgr.NewStateManager),
+			Override(new(stmgr.StateManagerAPI), stmgr.NewStateManager),
 			Override(new(*wallet.Wallet), wallet.NewWallet),
 			Override(new(*messagesigner.MessageSigner), messagesigner.NewMessageSigner),
 
