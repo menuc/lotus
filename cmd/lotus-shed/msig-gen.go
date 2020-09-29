@@ -15,6 +15,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/ipfs/go-cid"
+	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/minio/blake2b-simd"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/xerrors"
@@ -22,16 +23,21 @@ import (
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/lotus/api"
+	"github.com/filecoin-project/lotus/api/apibstore"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
 
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/lotus/chain/actors/adt"
+	"github.com/filecoin-project/lotus/chain/actors/builtin/multisig"
 	"github.com/filecoin-project/specs-actors/actors/builtin"
 	iact "github.com/filecoin-project/specs-actors/actors/builtin/init"
 	msig "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 )
 
 const defaultProgressFileName = "msig-creation-progress.json"
+
+const masterProgressFileName = "master-validation-progress.json"
 
 const blocksInADay = (24 * 60 * 60) / 30
 const blocksInAMonth = (blocksInADay * 365) / 12
@@ -82,9 +88,16 @@ type MsigCreationData struct {
 	VestingStartEpoch abi.ChainEpoch
 }
 
+type MasterTrackerEntry struct {
+	Created           bool
+	FirstReferencedIn string
+	FundsSent         bool
+}
+
 var createMsigsCmd = &cli.Command{
 	Name: "create-msigs",
 	Subcommands: []*cli.Command{
+		msigCreateSetupMasterTrackerCmd,
 		msigCreateStartCmd,
 		msigCreateCheckCreationCmd,
 		msigCreateSetVestingCmd,
@@ -94,6 +107,42 @@ var createMsigsCmd = &cli.Command{
 		msigCreateAuditsCmd,
 		msigCreateOutputCsvCmd,
 		msigCreateRemoveAdminsCmd,
+	},
+}
+
+var msigCreateSetupMasterTrackerCmd = &cli.Command{
+	Name:        "setup-master",
+	Description: "setup master tracker document from input master csv",
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass master csv input file")
+		}
+
+		if _, err := os.Stat(masterProgressFileName); err == nil {
+			return fmt.Errorf("master progress validation file already exists")
+		}
+
+		input, err := parseCreateParams(cctx.Args().First())
+		if err != nil {
+			return fmt.Errorf("failed to read input csv: %w", err)
+		}
+
+		out := make(map[string]*MasterTrackerEntry)
+		for _, inp := range input {
+			out[inp.Hash] = new(MasterTrackerEntry)
+		}
+
+		fi, err := os.Create(masterProgressFileName)
+		if err != nil {
+			return fmt.Errorf("failed to create %q: %w", masterProgressFileName, err)
+		}
+
+		defer fi.Close()
+		if err := json.NewEncoder(fi).Encode(out); err != nil {
+			return err
+		}
+
+		return nil
 	},
 }
 
@@ -125,6 +174,11 @@ var msigCreateStartCmd = &cli.Command{
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
+		}
+
+		mprog, err := loadMasterProgress()
+		if err != nil {
+			return fmt.Errorf("failed to load master progress file: %w", err)
 		}
 
 		if _, err := os.Stat(defaultProgressFileName); err == nil || !os.IsNotExist(err) {
@@ -161,7 +215,8 @@ var msigCreateStartCmd = &cli.Command{
 			}
 		}
 
-		params, err := parseCreateParams(cctx.Args().First())
+		inputCsv := cctx.Args().First()
+		params, err := parseCreateParams(inputCsv)
 		if err != nil {
 			return err
 		}
@@ -194,6 +249,18 @@ var msigCreateStartCmd = &cli.Command{
 					return fmt.Errorf("cannot have admin key %s as a signer", s)
 				}
 			}
+
+			ent, ok := mprog[p.Hash]
+			if !ok {
+				return fmt.Errorf("account %s not referenced in master progress file", p.Hash)
+			}
+
+			if ent.Created {
+				return fmt.Errorf("account %s already created, first referenced by %q", p.Hash, ent.FirstReferencedIn)
+			}
+
+			ent.Created = true
+			ent.FirstReferencedIn = inputCsv
 		}
 
 		for _, p := range params {
@@ -219,6 +286,10 @@ var msigCreateStartCmd = &cli.Command{
 				CreateCID: createCid,
 			})
 			fmt.Printf("created multisig for %s in %s\n", p.Hash, createCid)
+		}
+
+		if err := writeMasterProgress(mprog); err != nil {
+			return err
 		}
 
 		fi, err := os.Create(defaultProgressFileName)
@@ -1414,37 +1485,31 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 			return fmt.Errorf("failed to parse 'source' address: %w", err)
 		}
 
+		store := adt.WrapStore(ctx, cbor.NewCborStore(apibstore.NewAPIBlockstore(api)))
 		act, err := api.StateGetActor(ctx, sourceAddr, types.EmptyTSK)
 		if err != nil {
 			return err
 		}
 
-		data, err := api.ChainReadObj(ctx, act.Head)
-		if err != nil {
-			return err
-		}
-
-		var msigst msig.State
-		if err := msigst.UnmarshalCBOR(bytes.NewReader(data)); err != nil {
-			return err
-		}
-
-		ptxns, err := lcli.GetMultisigPending(ctx, api, msigst.PendingTxns)
+		msigst, err := multisig.Load(store, act)
 		if err != nil {
 			return err
 		}
 
 		type txnTracker struct {
-			Txn *msig.Transaction
+			Txn multisig.Transaction
 			ID  int64
 		}
 
 		bytarget := make(map[address.Address]txnTracker)
-		for id, txn := range ptxns {
+		if err := msigst.ForEachPendingTxn(func(id int64, txn multisig.Transaction) error {
 			bytarget[txn.To] = txnTracker{
 				Txn: txn,
 				ID:  id,
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 
 		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,Proposer,TxnID,Value,LockedAmount\n")
@@ -1464,7 +1529,12 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 				return fmt.Errorf("failed to look up multisig state: %w", err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%s,%d,%s,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), proposer, tid, types.FIL(value), types.FIL(st.InitialBalance))
+			signers, err := msigst.Signers()
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("%s,%s,%s,%s,%s,%d,%s,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(signers), types.FIL(act.Balance), proposer, tid, types.FIL(value), types.FIL(st.InitialBalance))
 		}
 
 		return nil
@@ -1648,4 +1718,27 @@ func getProgressWriter(fname string, msd *MsigCreationData) func() error {
 
 		return ioutil.WriteFile(fname, data, 644)
 	}
+}
+
+func loadMasterProgress() (map[string]*MasterTrackerEntry, error) {
+	fi, err := os.Open(masterProgressFileName)
+	if err != nil {
+		return nil, err
+	}
+	defer fi.Close()
+
+	var tracker map[string]*MasterTrackerEntry
+	if err := json.NewDecoder(fi).Decode(&tracker); err != nil {
+		return nil, err
+	}
+	return tracker, nil
+}
+
+func writeMasterProgress(mp map[string]*MasterTrackerEntry) error {
+	out, err := json.Marshal(mp)
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(masterProgressFileName, out, 0644)
 }
