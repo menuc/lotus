@@ -31,6 +31,8 @@ import (
 	msig "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 )
 
+const defaultProgressFileName = "msig-creation-progress.json"
+
 const blocksInADay = (24 * 60 * 60) / 30
 const blocksInAMonth = (blocksInADay * 365) / 12
 
@@ -55,8 +57,9 @@ type MsigCreationProgress struct {
 	CreateCID cid.Cid
 	ActorID   address.Address
 
-	SetVestingCID cid.Cid
-	FundsLocked   bool
+	SetVestingCID       cid.Cid
+	SetVestingApprovals []cid.Cid
+	FundsLocked         bool
 
 	SetThresholdCID cid.Cid
 	ThresholdSet    bool
@@ -124,6 +127,10 @@ var msigCreateStartCmd = &cli.Command{
 			return fmt.Errorf("must pass input file")
 		}
 
+		if _, err := os.Stat(defaultProgressFileName); err == nil || !os.IsNotExist(err) {
+			return fmt.Errorf("%q already exists, creation job already in progress?", defaultProgressFileName)
+		}
+
 		api, closer, err := lcli.GetFullNodeAPI(cctx)
 		if err != nil {
 			return err
@@ -165,12 +172,28 @@ var msigCreateStartCmd = &cli.Command{
 			VestingStartEpoch: abi.ChainEpoch(cctx.Int64("vesting-start")),
 		}
 
+		admins := make(map[address.Address]bool)
+		admins[createAddr] = true
+		for _, a := range adminAux {
+			admins[a] = true
+		}
+
 		seenHashes := make(map[string]bool)
 		for _, p := range params {
 			if seenHashes[p.Hash] {
 				return fmt.Errorf("duplicate account in input: %s", p.Hash)
 			}
 			seenHashes[p.Hash] = true
+
+			if len(adminAux)+1 < p.MultisigM {
+				return fmt.Errorf("not enough admin addresses to create and manage account %s: need %d", p.Hash, p.MultisigM)
+			}
+
+			for _, s := range p.Addresses {
+				if admins[s] {
+					return fmt.Errorf("cannot have admin key %s as a signer", s)
+				}
+			}
 		}
 
 		for _, p := range params {
@@ -180,11 +203,13 @@ var msigCreateStartCmd = &cli.Command{
 				controls = append(controls, adminAux...)
 			}
 
+			controls = controls[:p.MultisigM]
+
 			if !cctx.Bool("only-admin-keys") {
 				controls = append(controls, p.Addresses...)
 			}
 
-			createCid, err := api.MsigCreate(ctx, uint64(1+len(adminAux)), controls, 0, types.NewInt(0), createAddr, types.NewInt(0))
+			createCid, err := api.MsigCreate(ctx, uint64(p.MultisigM), controls, 0, types.NewInt(0), createAddr, types.NewInt(0))
 			if err != nil {
 				return xerrors.Errorf("failed to create multisigs: %w", err)
 			}
@@ -196,7 +221,7 @@ var msigCreateStartCmd = &cli.Command{
 			fmt.Printf("created multisig for %s in %s\n", p.Hash, createCid)
 		}
 
-		fi, err := os.Create("msig-creation-progress.json")
+		fi, err := os.Create(defaultProgressFileName)
 		if err != nil {
 			return err
 		}
@@ -457,7 +482,7 @@ var msigCreateSetVestingCheckCmd = &cli.Command{
 			}
 
 			if pr.Applied {
-				fmt.Printf("%s,%s,true,%s,-1,\n", job.Params.Hash, job.ActorID, job.SetVestingCID)
+				fmt.Printf("%s,%s,true,%s,%d,\n", job.Params.Hash, job.SetVestingCID, job.ActorID, -1)
 				job.FundsLocked = true
 				if err := writeProgress(); err != nil {
 					return err
@@ -509,8 +534,8 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 		},
 	},
 	Action: func(cctx *cli.Context) error {
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass input file")
+		if cctx.Args().Len() != 2 {
+			return fmt.Errorf("must pass progress file and set-vesting check file")
 		}
 
 		api, closer, err := lcli.GetFullNodeAPI(cctx)
@@ -521,7 +546,23 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 		defer closer()
 		ctx := lcli.ReqContext(cctx)
 
-		fi, err := os.Open(cctx.Args().First())
+		msd, err := loadMsd(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		writeProgress := getProgressWriter(cctx.Args().First(), msd)
+
+		findJob := func(hash string) *MsigCreationProgress {
+			for _, job := range msd.Jobs {
+				if job.Params.Hash == hash {
+					return job
+				}
+			}
+			return nil
+		}
+
+		fi, err := os.Open(cctx.Args().Get(1))
 		if err != nil {
 			return err
 		}
@@ -545,7 +586,7 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 
 			svc, err := cid.Decode(r[1])
 			if err != nil {
-				return err
+				return fmt.Errorf("decoding cid %s: %w", r[1], err)
 			}
 
 			var applied bool
@@ -580,7 +621,14 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 			return fmt.Errorf("failed to parse admin-key: %w", err)
 		}
 
+		var complete int
 		for _, svr := range svrows {
+			j := findJob(svr.Hash)
+			if j.Params.MultisigM <= 1+len(j.SetVestingApprovals) {
+				fmt.Printf("Job %s has sufficient approvals already\n", svr.Hash)
+				complete++
+				continue
+			}
 			params := &msig.TxnIDParams{
 				ID: svr.TxnID,
 			}
@@ -602,8 +650,15 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 				return fmt.Errorf("mpool push message failed: %w", err)
 			}
 
+			j.SetVestingApprovals = append(j.SetVestingApprovals, sm.Cid())
+			if err := writeProgress(); err != nil {
+				return fmt.Errorf("failed to save approval cid: %w", err)
+			}
+
 			fmt.Printf("approved txn %d on %s in msg %s\n", svr.TxnID, svr.ActorID, sm.Cid())
 		}
+
+		fmt.Printf("%d / %d jobs complete\n", complete, len(msd.Jobs))
 
 		return nil
 	},
@@ -1392,7 +1447,7 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 			}
 		}
 
-		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,Proposer,TxnID,Value\n")
+		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,Proposer,TxnID,Value,LockedAmount\n")
 		for _, job := range msd.Jobs {
 			tid := int64(-1)
 			value := abi.NewTokenAmount(0)
@@ -1404,12 +1459,12 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 				proposer = txn.Txn.Approved[0]
 			}
 
-			act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
+			st, act, err := getMsigState(ctx, api, job.ActorID)
 			if err != nil {
-				return fmt.Errorf("failed to get actor %s: %w", job.ActorID, err)
+				return fmt.Errorf("failed to look up multisig state: %w", err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%s,%d,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), proposer, tid, types.FIL(value))
+			fmt.Printf("%s,%s,%s,%s,%s,%d,%s,%s\n", job.Params.Hash, job.ActorID, addrsToColonString(msigst.Signers), types.FIL(act.Balance), proposer, tid, types.FIL(value), types.FIL(st.InitialBalance))
 		}
 
 		return nil
