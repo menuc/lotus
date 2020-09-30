@@ -1350,10 +1350,6 @@ func (w *WorkerStruct) Closing(ctx context.Context) (<-chan struct{}, error) {
 	return w.Internal.Closing(ctx)
 }
 
-func (g GatewayStruct) StateGetActor(ctx context.Context, actor address.Address, ts types.TipSetKey) (*types.Actor, error) {
-	return g.Internal.StateGetActor(ctx, actor, ts)
-}
-
 func (g GatewayStruct) ChainHead(ctx context.Context) (*types.TipSet, error) {
 	return g.Internal.ChainHead(ctx)
 }
@@ -1368,6 +1364,14 @@ func (g GatewayStruct) MpoolPush(ctx context.Context, sm *types.SignedMessage) (
 
 func (g GatewayStruct) StateAccountKey(ctx context.Context, addr address.Address, tsk types.TipSetKey) (address.Address, error) {
 	return g.Internal.StateAccountKey(ctx, addr, tsk)
+}
+
+func (g GatewayStruct) StateGetActor(ctx context.Context, actor address.Address, ts types.TipSetKey) (*types.Actor, error) {
+	return g.Internal.StateGetActor(ctx, actor, ts)
+}
+
+func (g GatewayStruct) StateLookupID(ctx context.Context, addr address.Address, tsk types.TipSetKey) (address.Address, error) {
+	panic("implement me")
 }
 
 var _ api.Common = &CommonStruct{}
