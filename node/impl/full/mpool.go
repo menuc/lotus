@@ -15,11 +15,16 @@ import (
 	"github.com/filecoin-project/lotus/node/modules/dtypes"
 )
 
+type PushMessageAPI interface {
+	MpoolPush(ctx context.Context, smsg *types.SignedMessage) (cid.Cid, error)
+}
+
 type MpoolAPI struct {
 	fx.In
 
 	WalletAPI
 	GasAPI
+	PushMessageAPI
 
 	MessageSigner *messagesigner.MessageSigner
 
@@ -107,7 +112,7 @@ func (a *MpoolAPI) MpoolClear(ctx context.Context, local bool) error {
 }
 
 func (a *MpoolAPI) MpoolPush(ctx context.Context, smsg *types.SignedMessage) (cid.Cid, error) {
-	return a.Mpool.Push(smsg)
+	return a.PushMessageAPI.MpoolPush(ctx, smsg)
 }
 
 func (a *MpoolAPI) MpoolPushMessage(ctx context.Context, msg *types.Message, spec *api.MessageSendSpec) (*types.SignedMessage, error) {
@@ -161,7 +166,7 @@ func (a *MpoolAPI) MpoolPushMessage(ctx context.Context, msg *types.Message, spe
 		return nil, xerrors.Errorf("mpool push: failed to sign message: %w", err)
 	}
 
-	_, err = a.Mpool.Push(smsg)
+	_, err = a.MpoolPush(ctx, smsg)
 	if err != nil {
 		return nil, xerrors.Errorf("mpool push: failed to push message: %w", err)
 	}
