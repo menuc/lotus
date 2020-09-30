@@ -1182,6 +1182,11 @@ var msigCreateFillProposeCmd = &cli.Command{
 
 		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
+		progm, err := loadMasterProgress()
+		if err != nil {
+			return fmt.Errorf("failed to load master progress file: %w", err)
+		}
+
 		sourceAddr, err := address.NewFromString(cctx.String("source"))
 		if err != nil {
 			return fmt.Errorf("failed to parse 'source' address: %w", err)
@@ -1196,9 +1201,24 @@ var msigCreateFillProposeCmd = &cli.Command{
 			if !job.FundsLocked {
 				return fmt.Errorf("vesting schedule not set for all wallets yet, please set vesting before sending funds")
 			}
+
+			ent, ok := progm[job.Params.Hash]
+			if !ok {
+				return fmt.Errorf("account %s not found in the master tracker list", job.Params.Hash)
+			}
+
+			if ent.FundsSent {
+				return fmt.Errorf("already sent funds to account %s", job.Params.Hash)
+			}
+			ent.FundsSent = true
+		}
+
+		if err := writeMasterProgress(progm); err != nil {
+			return fmt.Errorf("failed to write master progress file: %w", err)
 		}
 
 		for _, job := range msd.Jobs {
+
 			addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
 			if err != nil {
 				return fmt.Errorf("failed to lookup ID: %w", err)
