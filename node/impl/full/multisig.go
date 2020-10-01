@@ -3,8 +3,6 @@ package full
 import (
 	"context"
 
-	"github.com/filecoin-project/lotus/chain/stmgr"
-
 	"github.com/filecoin-project/go-state-types/big"
 
 	"github.com/filecoin-project/go-address"
@@ -27,8 +25,8 @@ import (
 type MsigAPI struct {
 	fx.In
 
-	StateManagerAPI stmgr.StateManagerAPI
-	MpoolAPI        MpoolAPI
+	StateAPI StateAPI
+	MpoolAPI MpoolAPI
 }
 
 // TODO: remove gp (gasPrice) from arguments
@@ -214,7 +212,7 @@ func (a *MsigAPI) msigApproveOrCancel(ctx context.Context, operation api.MsigPro
 	}
 
 	if proposer.Protocol() != address.ID {
-		proposerID, err := a.StateManagerAPI.LookupID(ctx, proposer, nil)
+		proposerID, err := a.StateAPI.StateLookupID(ctx, proposer, types.EmptyTSK)
 		if err != nil {
 			return cid.Undef, err
 		}
