@@ -35,6 +35,16 @@ import (
 	msig "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 )
 
+var custodianWhitelist = map[string]bool{
+	"coinlist":       true,
+	"coinbase":       true,
+	"gemini":         true,
+	"anchorage":      true,
+	"self-glif":      true,
+	"self-other":     true,
+	"self-polychain": true,
+}
+
 const defaultProgressFileName = "msig-creation-progress.json"
 
 const masterProgressFileName = "master-validation-progress.json"
@@ -45,6 +55,7 @@ const blocksInAMonth = (blocksInADay * 365) / 12
 type CreateParams struct {
 	Name          string
 	Entity        string
+	Email         string
 	Hash          string
 	Amount        string
 	VestingMonths int
@@ -63,13 +74,17 @@ type MsigCreationProgress struct {
 	CreateCID cid.Cid
 	ActorID   address.Address
 
+	AddAddrCids []cid.Cid
+
+	SetThresholdCID cid.Cid
+
+	//
+
 	SetVestingCID       cid.Cid
 	SetVestingApprovals []cid.Cid
 	FundsLocked         bool
 
-	SetThresholdCID cid.Cid
-	ThresholdSet    bool
-
+	ThresholdSet     bool
 	RemoveControlCID cid.Cid
 	ControlChanged   bool
 
@@ -88,61 +103,25 @@ type MsigCreationData struct {
 	VestingStartEpoch abi.ChainEpoch
 }
 
-type MasterTrackerEntry struct {
-	Created           bool
-	FirstReferencedIn string
-	FundsSent         bool
+func (msd *MsigCreationData) findJob(hash string) *MsigCreationProgress {
+	for _, j := range msd.Jobs {
+		if j.Params.Hash == hash {
+			return j
+		}
+	}
+	return nil
 }
 
 var createMsigsCmd = &cli.Command{
 	Name: "create-msigs",
 	Subcommands: []*cli.Command{
-		msigCreateSetupMasterTrackerCmd,
 		msigCreateStartCmd,
 		msigCreateCheckCreationCmd,
 		msigCreateSetVestingCmd,
-		msigCreateNextCmd,
-		msigCreateVerifyCmd,
 		msigCreateFillCmd,
 		msigCreateAuditsCmd,
-		msigCreateOutputCsvCmd,
 		msigCreateRemoveAdminsCmd,
-	},
-}
-
-var msigCreateSetupMasterTrackerCmd = &cli.Command{
-	Name:        "setup-master",
-	Description: "setup master tracker document from input master csv",
-	Action: func(cctx *cli.Context) error {
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass master csv input file")
-		}
-
-		if _, err := os.Stat(masterProgressFileName); err == nil {
-			return fmt.Errorf("master progress validation file already exists")
-		}
-
-		input, err := parseCreateParams(cctx.Args().First())
-		if err != nil {
-			return fmt.Errorf("failed to read input csv: %w", err)
-		}
-
-		out := make(map[string]*MasterTrackerEntry)
-		for _, inp := range input {
-			out[inp.Hash] = new(MasterTrackerEntry)
-		}
-
-		fi, err := os.Create(masterProgressFileName)
-		if err != nil {
-			return fmt.Errorf("failed to create %q: %w", masterProgressFileName, err)
-		}
-
-		defer fi.Close()
-		if err := json.NewEncoder(fi).Encode(out); err != nil {
-			return err
-		}
-
-		return nil
+		msigCreateOutputCsvCmd,
 	},
 }
 
@@ -162,23 +141,10 @@ var msigCreateStartCmd = &cli.Command{
 			Name:  "admin-aux",
 			Usage: "additional admin keys for setting up wallets with",
 		},
-		&cli.BoolFlag{
-			Name:  "skip-remove",
-			Usage: "set to skip removal of initial control address during setup flow",
-		},
-		&cli.BoolFlag{
-			Name:  "only-admin-keys",
-			Usage: "only insert admin keys during initial creation",
-		},
 	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
-		}
-
-		mprog, err := loadMasterProgress()
-		if err != nil {
-			return fmt.Errorf("failed to load master progress file: %w", err)
 		}
 
 		if _, err := os.Stat(defaultProgressFileName); err == nil || !os.IsNotExist(err) {
@@ -216,7 +182,7 @@ var msigCreateStartCmd = &cli.Command{
 		}
 
 		inputCsv := cctx.Args().First()
-		params, err := parseCreateParams(inputCsv)
+		params, err := parseCreationCsv(inputCsv)
 		if err != nil {
 			return err
 		}
@@ -227,12 +193,6 @@ var msigCreateStartCmd = &cli.Command{
 			VestingStartEpoch: abi.ChainEpoch(cctx.Int64("vesting-start")),
 		}
 
-		admins := make(map[address.Address]bool)
-		admins[createAddr] = true
-		for _, a := range adminAux {
-			admins[a] = true
-		}
-
 		seenHashes := make(map[string]bool)
 		for _, p := range params {
 			if seenHashes[p.Hash] {
@@ -240,43 +200,10 @@ var msigCreateStartCmd = &cli.Command{
 			}
 			seenHashes[p.Hash] = true
 
-			if len(adminAux)+1 < p.MultisigM {
-				return fmt.Errorf("not enough admin addresses to create and manage account %s: need %d", p.Hash, p.MultisigM)
-			}
-
-			for _, s := range p.Addresses {
-				if admins[s] {
-					return fmt.Errorf("cannot have admin key %s as a signer", s)
-				}
-			}
-
-			ent, ok := mprog[p.Hash]
-			if !ok {
-				return fmt.Errorf("account %s not referenced in master progress file", p.Hash)
-			}
-
-			if ent.Created {
-				return fmt.Errorf("account %s already created, first referenced by %q", p.Hash, ent.FirstReferencedIn)
-			}
-
-			ent.Created = true
-			ent.FirstReferencedIn = inputCsv
 		}
 
 		for _, p := range params {
-			controls := []address.Address{createAddr}
-
-			if len(adminAux) > 0 {
-				controls = append(controls, adminAux...)
-			}
-
-			controls = controls[:p.MultisigM]
-
-			if !cctx.Bool("only-admin-keys") {
-				controls = append(controls, p.Addresses...)
-			}
-
-			createCid, err := api.MsigCreate(ctx, uint64(p.MultisigM), controls, 0, types.NewInt(0), createAddr, types.NewInt(0))
+			createCid, err := api.MsigCreate(ctx, 1, []address.Address{createAddr}, 0, types.NewInt(0), createAddr, types.NewInt(0))
 			if err != nil {
 				return xerrors.Errorf("failed to create multisigs: %w", err)
 			}
@@ -286,10 +213,6 @@ var msigCreateStartCmd = &cli.Command{
 				CreateCID: createCid,
 			})
 			fmt.Printf("created multisig for %s in %s\n", p.Hash, createCid)
-		}
-
-		if err := writeMasterProgress(mprog); err != nil {
-			return err
 		}
 
 		fi, err := os.Create(defaultProgressFileName)
@@ -306,7 +229,7 @@ var msigCreateStartCmd = &cli.Command{
 	},
 }
 
-func parseCreateParams(fname string) ([]CreateParams, error) {
+func parseCreationCsv(fname string) ([]CreateParams, error) {
 	fi, err := os.Open(fname)
 	if err != nil {
 		return nil, err
@@ -325,29 +248,29 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 			return nil, fmt.Errorf("records on row %d were invalid", i)
 		}
 
-		amt, err := types.ParseFIL(r[3])
+		amt, err := types.ParseFIL(r[4])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse value field of row %d: %w", i, err)
 		}
 
-		vmonths, err := strconv.Atoi(r[4])
+		vmonths, err := strconv.Atoi(r[6])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse vesting months field of row %d: %w", i, err)
 		}
 
-		msigM, err := strconv.Atoi(r[5])
+		msigM, err := strconv.Atoi(r[7])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse msigM field of row %d: %w", i, err)
 		}
 
-		msigN, err := strconv.Atoi(r[6])
+		msigN, err := strconv.Atoi(r[8])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse msigN field of row %d: %w", i, err)
 		}
 
 		addrDups := make(map[address.Address]bool)
 		var addresses []address.Address
-		for j, a := range strings.Split(r[7], ":") {
+		for j, a := range strings.Split(r[9], ":") {
 			addr, err := address.NewFromString(strings.TrimSpace(a))
 			if err != nil {
 				return nil, fmt.Errorf("failed to parse address %d on row %d: %w", j, i, err)
@@ -361,11 +284,15 @@ func parseCreateParams(fname string) ([]CreateParams, error) {
 		if len(addresses) != msigN {
 			return nil, fmt.Errorf("length of addresses set in row %d does not match multisig N field", i)
 		}
+		if msigM > len(addresses) {
+			return nil, fmt.Errorf("row %d: M value greater than number of addresses", i)
+		}
 
 		p := CreateParams{
 			Name:          r[0],
 			Entity:        r[1],
-			Hash:          r[2],
+			Email:         r[2],
+			Hash:          r[3],
 			Amount:        amt.String(),
 			VestingMonths: vmonths,
 			Custodian:     r[5],
@@ -442,6 +369,235 @@ var msigCreateCheckCreationCmd = &cli.Command{
 
 		return nil
 	},
+}
+
+var msigCreateSetupCmd = &cli.Command{
+	Name:        "setup",
+	Description: "setup wallets for a particular custodian after creation",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "specify the custodian to run wallet setup for",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+		if !cctx.Args().Present() {
+			return fmt.Errorf("must pass input file")
+		}
+
+		api, closer, err := lcli.GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+
+		defer closer()
+		ctx := lcli.ReqContext(cctx)
+
+		progressFname := cctx.Args().Get(0)
+		inputCsv := cctx.Args().Get(1)
+
+		masterCsv, err := parseCreationCsv(inputCsv)
+		if err != nil {
+			return err
+		}
+
+		msd, err := loadMsd(progressFname)
+		if err != nil {
+			return err
+		}
+
+		custodian := cctx.String("custodian")
+		if !custodianWhitelist[custodian] {
+			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
+		}
+
+		writeProgress := getProgressWriter(progressFname, msd)
+
+		// filter out just the rows we're going to work with
+		var jobs []*MsigCreationProgress
+		for _, inp := range masterCsv {
+			if inp.Custodian != custodian {
+				continue
+			}
+
+			// some sanity checking...
+			job := msd.findJob(inp.Hash)
+			if job == nil {
+				return fmt.Errorf("account %s was not in the original master csv file", inp.Hash)
+			}
+
+			if inp.MultisigM > 1+len(msd.AdminAux) {
+				return fmt.Errorf("not enough aux admin addresses for account %s (need %d total)", job.Params.Hash, inp.MultisigM)
+			}
+
+			if job.ActorID == address.Undef {
+				return fmt.Errorf("actor creation for %s has not completed", job.Params.Hash)
+			}
+
+			if job.Params.MultisigM == 0 {
+				return fmt.Errorf("account %s does not have M set", job.Params.Hash)
+			}
+
+			job.Params = inp
+			jobs = append(jobs, job)
+		}
+
+		fmt.Printf("Found %d accounts for custodian %q\n", len(jobs), custodian)
+
+		for _, j := range jobs {
+			st, _, err := getMsigState(ctx, api, j.ActorID)
+			if err != nil {
+				return err
+			}
+
+			if st.NumApprovalsThreshold != 1 {
+				return fmt.Errorf("actor %s for account %s already has threshold of %d, aborting", j.ActorID, j.Params.Hash, st.NumApprovalsThreshold)
+			}
+
+			if len(j.AddAddrCids) > 0 {
+				fmt.Printf("account %s already has 'AddAddrs' proposed\n", j.Params.Hash)
+
+				if len(j.AddAddrCids)+1 != j.Params.MultisigM+j.Params.MultisigN {
+					// if less than the required amount, we could potentially continue here...
+					return fmt.Errorf("account %s has incorrect number of add address proposals: expected %d, have %d", j.Params.Hash, j.Params.MultisigN+j.Params.MultisigM-1, len(j.AddAddrCids))
+				}
+
+				// already proposed addAddrs, i guess we can continue
+				continue
+			}
+
+			nControlAdd := j.Params.MultisigM - 1
+			toAdd := make([]address.Address, j.Params.MultisigN+nControlAdd)
+			copy(toAdd, msd.AdminAux[:nControlAdd])
+			copy(toAdd[nControlAdd:], j.Params.Addresses)
+
+			fmt.Printf("adding %d keys for account %s\n", len(toAdd), j.Params.Hash)
+			for i, a := range toAdd {
+				addSigner := &msig.AddSignerParams{
+					Signer: a,
+				}
+
+				mcid, err := msigPropose(ctx, api, msd.Creator, j.ActorID, addSigner, builtin.MethodsMultisig.AddSigner)
+				if err != nil {
+					return fmt.Errorf("failed to propose add signer: %w", err)
+				}
+
+				fmt.Printf("\t%d / %d - adding %s in %s\n", i, j.Params.MultisigM-1, a, mcid)
+				j.AddAddrCids = append(j.AddAddrCids, mcid)
+				if err := writeProgress(); err != nil {
+					return fmt.Errorf("failed to write progress: %w", err)
+				}
+			}
+		}
+
+		// Now wait for all the adds to land
+		for i, j := range jobs {
+			fmt.Printf("%d / %d - Waiting for add signer for %s\n", i, len(jobs), j.Params.Hash)
+			for _, c := range j.AddAddrCids {
+				lookup, err := api.StateWaitMsg(ctx, c, 4)
+				if err != nil {
+					return fmt.Errorf("waiting for %s of account %s failed: %w", c, j.Params.Hash, err)
+				}
+
+				if lookup.Receipt.ExitCode != 0 {
+					return fmt.Errorf("add signer msg %s of account %s failed: exit code %d", c, j.Params.Hash, lookup.Receipt.ExitCode)
+				}
+			}
+		}
+
+		// Verify all addresses were correctly added
+		for i, j := range jobs {
+			fmt.Printf("%d / %d - Checking account state for %s\n", i, len(jobs), j.Params.Hash)
+
+			msigst, _, err := getMsigState(ctx, api, j.ActorID)
+			if err != nil {
+				return err
+			}
+
+			expAddrs := []address.Address{msd.Creator}
+			expAddrs = append(expAddrs, msd.AdminAux[:j.Params.MultisigM-1]...)
+			expAddrs = append(expAddrs, j.Params.Addresses...)
+
+			if !addressSetsMatch(msigst.Signers, expAddrs) {
+				return fmt.Errorf("addresses in state did not match for account %s (%s): expected %v, got %v", j.Params.Hash, j.ActorID, expAddrs, msigst.Signers)
+			}
+		}
+
+		// Set the multisig threshold
+		for i, j := range jobs {
+			if j.Params.MultisigM == 1 {
+				continue
+			}
+
+			if j.SetThresholdCID != cid.Undef {
+				fmt.Printf("set approval threshold proposal already sent for %s in %s", j.Params.Hash, j.SetThresholdCID)
+			}
+
+			changeThresh := &msig.ChangeNumApprovalsThresholdParams{
+				NewThreshold: uint64(j.Params.MultisigM),
+			}
+
+			mcid, err := msigPropose(ctx, api, msd.Creator, j.ActorID, changeThresh, builtin.MethodsMultisig.ChangeNumApprovalsThreshold)
+			if err != nil {
+				return fmt.Errorf("failed to propose set threshold for %s: %w", j.Params.Hash, err)
+			}
+			fmt.Printf("%d / %d - setting approval threshold for %s to %d in %s\n", i, len(jobs), j.Params.Hash, changeThresh.NewThreshold, mcid)
+
+			j.SetThresholdCID = mcid
+			if err := writeProgress(); err != nil {
+				return fmt.Errorf("failed to write progress: %w", err)
+			}
+		}
+
+		// now wait for all the threshold sets to land on chain
+		for i, j := range jobs {
+			fmt.Printf("%d / %d - Waiting for set threshold for %s\n", i, len(jobs), j.Params.Hash)
+			lookup, err := api.StateWaitMsg(ctx, j.SetThresholdCID, 4)
+			if err != nil {
+				return fmt.Errorf("waiting for %s of account %s failed: %w", j.SetThresholdCID, j.Params.Hash, err)
+			}
+
+			if lookup.Receipt.ExitCode != 0 {
+				return fmt.Errorf("set threshold msg %s of account %s failed: exit code %d", j.SetThresholdCID, j.Params.Hash, lookup.Receipt.ExitCode)
+			}
+		}
+
+		// Verify threshold has been correctly changed
+		for _, j := range jobs {
+			msigst, _, err := getMsigState(ctx, api, j.ActorID)
+			if err != nil {
+				return err
+			}
+			if msigst.NumApprovalsThreshold != uint64(j.Params.MultisigM) {
+				return fmt.Errorf("failed to properly set multisig threshold for %s", j.Params.Hash)
+			}
+		}
+
+		return nil
+	},
+}
+
+func addressSetsMatch(a, b []address.Address) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	setA := make(map[address.Address]bool)
+	for _, addr := range a {
+		setA[addr] = true
+	}
+
+	setB := make(map[address.Address]bool) // guard against duplicates causing a subset to validate as the same [a, b ,c] != [a, a, c]
+	for _, addr := range b {
+		setB[addr] = true
+		if !setA[addr] {
+			return false
+		}
+	}
+	if len(setA) != len(setB) {
+		return false
+	}
+	return true
 }
 
 var msigCreateSetVestingCmd = &cli.Command{
@@ -735,223 +891,6 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 	},
 }
 
-var msigCreateNextCmd = &cli.Command{
-	Name:        "next",
-	Description: "perform next required processing for multisig creation",
-	Flags:       []cli.Flag{},
-	Action: func(cctx *cli.Context) error {
-		return fmt.Errorf("this method is deprecated, i'm only keeping it around to copy bits out of it into other commands")
-
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass input file")
-		}
-
-		api, closer, err := lcli.GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-
-		defer closer()
-		ctx := lcli.ReqContext(cctx)
-
-		msd, err := loadMsd(cctx.Args().First())
-		if err != nil {
-			return err
-		}
-
-		writeProgress := getProgressWriter(cctx.Args().First(), msd)
-
-		var progress int
-		for _, job := range msd.Jobs {
-			if job.Complete {
-				fmt.Printf("Jobs complete: %d / %d\n", progress, len(msd.Jobs))
-				progress++
-				continue
-			}
-			if job.ActorID == address.Undef {
-				fmt.Println("finding creation receipt for ", job.Params.Name)
-				r, err := api.StateGetReceipt(ctx, job.CreateCID, types.EmptyTSK)
-				if err != nil {
-					log.Warnf("no receipt found for %s", job.CreateCID)
-				} else {
-					if r != nil {
-						if r.ExitCode != 0 {
-							fmt.Printf("creation job failed for %s %s %s: %d\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, r.ExitCode)
-						} else {
-							var er iact.ExecReturn
-							if err := er.UnmarshalCBOR(bytes.NewReader(r.Return)); err != nil {
-								return xerrors.Errorf("return value of create message failed to parse: %w", err)
-							}
-
-							fmt.Printf("actor create successful: %s %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, er.RobustAddress)
-							job.ActorID = er.RobustAddress
-							if err := writeProgress(); err != nil {
-								return err
-							}
-						}
-					} else {
-						fmt.Printf("creation message for %s hasnt made it into the chain yet\n", job.Params.Custodian)
-					}
-				}
-			}
-
-			if job.ActorID != address.Undef && !job.SetVestingCID.Defined() {
-				famt, err := types.ParseFIL(job.Params.Amount)
-				if err != nil {
-					return xerrors.Errorf("failed to parse fil amount: %w", err)
-				}
-				params := &msig.LockBalanceParams{
-					StartEpoch:     0,
-					UnlockDuration: abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths),
-					Amount:         big.Int(famt),
-				}
-
-				lmcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.LockBalance)
-				if err != nil {
-					return fmt.Errorf("failed to propose lock funds operation on %s: %w", jobStr(job), err)
-				}
-
-				job.SetVestingCID = lmcid
-				if err := writeProgress(); err != nil {
-					return err
-				}
-				fmt.Printf("proposed funds locking for %s in %s\n", job.Params.Name, lmcid)
-			}
-
-			if job.SetVestingCID.Defined() && !job.FundsLocked {
-				fmt.Println("finding funds locking receipt for ", job.Params.Name)
-				pr, err := checkProposeReceipt(ctx, api, job.SetVestingCID)
-				if err != nil {
-					fmt.Printf("set vesting (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
-					continue
-				}
-
-				if !pr.Applied {
-					fmt.Printf("set vesting (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, "transaction not applied")
-					continue
-				}
-
-				fmt.Printf("funds locking successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
-				job.FundsLocked = true
-				if err := writeProgress(); err != nil {
-					return err
-				}
-
-			}
-
-			if job.Params.MultisigM == 1 && !job.ThresholdSet {
-				job.ThresholdSet = true
-				fmt.Printf("no need to change threshold for %s, already 1\n", job.Params.Name)
-				if err := writeProgress(); err != nil {
-					return err
-				}
-			}
-
-			act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
-			if err != nil {
-				fmt.Printf("could not get actor on chain for %s: %s", job.ActorID, err)
-				continue
-			}
-			reqamt, err := types.ParseFIL(job.Params.Amount)
-			if err != nil {
-				return fmt.Errorf("failed to parse amount in job %s: %w", jobStr(job), err)
-			}
-
-			if types.BigCmp(act.Balance, types.BigInt(reqamt)) < 0 {
-				fmt.Printf("Need to send funds to %s: Balance %s < %s\n", jobStr(job), act.Balance, reqamt)
-				continue
-			}
-
-			if job.FundsLocked && job.Params.MultisigM != 1 && !job.SetThresholdCID.Defined() {
-				params := &msig.ChangeNumApprovalsThresholdParams{
-					NewThreshold: uint64(job.Params.MultisigM),
-				}
-
-				mcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.ChangeNumApprovalsThreshold)
-				if err != nil {
-					return fmt.Errorf("failed to propose approval threshold change for %s %s %s: %w", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
-				}
-
-				job.SetThresholdCID = mcid
-				if err := writeProgress(); err != nil {
-					return err
-				}
-			}
-
-			if job.SetThresholdCID.Defined() && !job.ThresholdSet {
-				fmt.Println("finding set threshold receipt for ", job.Params.Name)
-				pr, err := checkProposeReceipt(ctx, api, job.SetThresholdCID)
-				if err != nil {
-					fmt.Printf("set threshold (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
-					continue
-				}
-
-				if !pr.Applied {
-					fmt.Printf("set threshold (%s %s %s) not complete: %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity, "transaction not applied")
-					continue
-				}
-
-				fmt.Printf("set threshold successful: %s %s %s\n", job.Params.Name, job.Params.Custodian, job.Params.Entity)
-				job.ThresholdSet = true
-				if err := writeProgress(); err != nil {
-					return err
-				}
-			}
-
-			if job.ThresholdSet && !job.RemoveControlCID.Defined() && !msd.SkipRemove {
-				params := &msig.RemoveSignerParams{
-					Signer: msd.Creator,
-				}
-
-				fmt.Println("Proposing removal of control address on ", job.ActorID)
-				mcid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
-				if err != nil {
-					return fmt.Errorf("failed to propose remove signer for %s %s %s: %w", job.Params.Name, job.Params.Custodian, job.Params.Entity, err)
-				}
-
-				job.RemoveControlCID = mcid
-				if err := writeProgress(); err != nil {
-					return err
-				}
-			}
-
-			if !job.ControlChanged && job.RemoveControlCID.Defined() {
-				if job.Params.MultisigM == 1 {
-					fmt.Println("finding remove control address message for ", job.Params.Name)
-					pr, err := checkProposeReceipt(ctx, api, job.RemoveControlCID)
-					if err != nil {
-						fmt.Println("removing control address not complete")
-						continue
-					}
-
-					if !pr.Applied {
-						fmt.Println("removing control address not complete")
-						continue
-					}
-
-					fmt.Println("proposal of address removal complete")
-				}
-				job.ControlChanged = true // eh, close enough
-				if err := writeProgress(); err != nil {
-					return err
-				}
-			}
-
-			if job.ControlChanged || msd.SkipRemove {
-				// nothing else to do, this ones complete
-				progress++
-				job.Complete = true
-				if err := writeProgress(); err != nil {
-					return err
-				}
-			}
-		}
-		fmt.Printf("%d / %d Jobs complete\n", progress, len(msd.Jobs))
-
-		return nil
-	},
-}
-
 func checkProposeReceipt(ctx context.Context, api api.FullNode, c cid.Cid) (*msig.ProposeReturn, error) {
 	r, err := api.StateGetReceipt(ctx, c, types.EmptyTSK)
 	if err != nil {
@@ -1021,6 +960,7 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 
 }
 
+/* TODO: unused, delete?
 var msigCreateVerifyCmd = &cli.Command{
 	Name:        "verify",
 	Description: "verify wallets were properly setup",
@@ -1109,6 +1049,7 @@ var msigCreateVerifyCmd = &cli.Command{
 		return nil
 	},
 }
+*/
 
 func goodbad(good bool, format string, args ...interface{}) {
 	if good {
@@ -1182,11 +1123,6 @@ var msigCreateFillProposeCmd = &cli.Command{
 
 		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
-		progm, err := loadMasterProgress()
-		if err != nil {
-			return fmt.Errorf("failed to load master progress file: %w", err)
-		}
-
 		sourceAddr, err := address.NewFromString(cctx.String("source"))
 		if err != nil {
 			return fmt.Errorf("failed to parse 'source' address: %w", err)
@@ -1201,20 +1137,6 @@ var msigCreateFillProposeCmd = &cli.Command{
 			if !job.FundsLocked {
 				return fmt.Errorf("vesting schedule not set for all wallets yet, please set vesting before sending funds")
 			}
-
-			ent, ok := progm[job.Params.Hash]
-			if !ok {
-				return fmt.Errorf("account %s not found in the master tracker list", job.Params.Hash)
-			}
-
-			if ent.FundsSent {
-				return fmt.Errorf("already sent funds to account %s", job.Params.Hash)
-			}
-			ent.FundsSent = true
-		}
-
-		if err := writeMasterProgress(progm); err != nil {
-			return fmt.Errorf("failed to write master progress file: %w", err)
 		}
 
 		for _, job := range msd.Jobs {
@@ -1738,27 +1660,4 @@ func getProgressWriter(fname string, msd *MsigCreationData) func() error {
 
 		return ioutil.WriteFile(fname, data, 644)
 	}
-}
-
-func loadMasterProgress() (map[string]*MasterTrackerEntry, error) {
-	fi, err := os.Open(masterProgressFileName)
-	if err != nil {
-		return nil, err
-	}
-	defer fi.Close()
-
-	var tracker map[string]*MasterTrackerEntry
-	if err := json.NewDecoder(fi).Decode(&tracker); err != nil {
-		return nil, err
-	}
-	return tracker, nil
-}
-
-func writeMasterProgress(mp map[string]*MasterTrackerEntry) error {
-	out, err := json.Marshal(mp)
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(masterProgressFileName, out, 0644)
 }
