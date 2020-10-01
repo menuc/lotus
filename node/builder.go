@@ -262,9 +262,12 @@ func Online() Option {
 			Override(new(*store.ChainStore), modules.ChainStore),
 			Override(new(*stmgr.StateManager), stmgr.NewStateManager),
 			Override(new(stmgr.StateManagerAPI), From(new(*stmgr.StateManager))),
-			Override(new(full.PushMessageAPI), new(full.MpoolAPI)),
 			Override(new(*wallet.Wallet), wallet.NewWallet),
 			Override(new(*messagesigner.MessageSigner), messagesigner.NewMessageSigner),
+
+			Override(new(full.ChainModuleAPI), From(new(full.ChainModule))),
+			Override(new(full.StateModuleAPI), From(new(full.StateModule))),
+			Override(new(full.MpoolModuleAPI), From(new(full.MpoolModule))),
 
 			Override(new(dtypes.ChainGCLocker), blockstore.NewGCLocker),
 			Override(new(dtypes.ChainGCBlockstore), modules.ChainGCBlockstore),
