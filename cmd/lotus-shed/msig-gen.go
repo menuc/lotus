@@ -117,6 +117,7 @@ var createMsigsCmd = &cli.Command{
 	Subcommands: []*cli.Command{
 		msigCreateStartCmd,
 		msigCreateCheckCreationCmd,
+		msigCreateSetupCmd,
 		msigCreateSetVestingCmd,
 		msigCreateFillCmd,
 		msigCreateAuditsCmd,
@@ -407,6 +408,9 @@ var msigCreateSetupCmd = &cli.Command{
 		}
 
 		custodian := cctx.String("custodian")
+		if custodian == "" {
+			return fmt.Errorf("must specify custodian to run wallet setup for")
+		}
 		if !custodianWhitelist[custodian] {
 			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
 		}
@@ -451,7 +455,8 @@ var msigCreateSetupCmd = &cli.Command{
 			}
 
 			if st.NumApprovalsThreshold != 1 {
-				return fmt.Errorf("actor %s for account %s already has threshold of %d, aborting", j.ActorID, j.Params.Hash, st.NumApprovalsThreshold)
+				fmt.Printf("actor %s for account %s already has threshold of %d, refusing to change address set (already in progress?)\n", j.ActorID, j.Params.Hash, st.NumApprovalsThreshold)
+				continue
 			}
 
 			if len(j.AddAddrCids) > 0 {
@@ -518,19 +523,25 @@ var msigCreateSetupCmd = &cli.Command{
 			expAddrs = append(expAddrs, msd.AdminAux[:j.Params.MultisigM-1]...)
 			expAddrs = append(expAddrs, j.Params.Addresses...)
 
-			if !addressSetsMatch(msigst.Signers, expAddrs) {
-				return fmt.Errorf("addresses in state did not match for account %s (%s): expected %v, got %v", j.Params.Hash, j.ActorID, expAddrs, msigst.Signers)
+			pubSigs, err := toPublicKeys(ctx, api, msigst.Signers)
+			if err != nil {
+				return err
+			}
+			if !addressSetsMatch(pubSigs, expAddrs) {
+				return fmt.Errorf("addresses in state did not match for account %s (%s): expected %v, got %v", j.Params.Hash, j.ActorID, expAddrs, pubSigs)
 			}
 		}
 
 		// Set the multisig threshold
 		for i, j := range jobs {
 			if j.Params.MultisigM == 1 {
+				fmt.Printf("%d / %d - setting approval threshold for %s, M=1, no action necessary\n", i, len(jobs), j.Params.Hash)
 				continue
 			}
 
 			if j.SetThresholdCID != cid.Undef {
-				fmt.Printf("set approval threshold proposal already sent for %s in %s", j.Params.Hash, j.SetThresholdCID)
+				fmt.Printf("set approval threshold proposal already sent for %s in %s\n", j.Params.Hash, j.SetThresholdCID)
+				continue
 			}
 
 			changeThresh := &msig.ChangeNumApprovalsThresholdParams{
@@ -551,10 +562,18 @@ var msigCreateSetupCmd = &cli.Command{
 
 		// now wait for all the threshold sets to land on chain
 		for i, j := range jobs {
+			if j.Params.MultisigM == 1 {
+				fmt.Printf("%d / %d - Desired M is already 1, no action necessary for %s\n", i, len(jobs), j.Params.Hash)
+				continue
+			}
+
+			if j.SetThresholdCID == cid.Undef {
+				return fmt.Errorf("no set threshold cid found for %s", j.Params.Hash)
+			}
 			fmt.Printf("%d / %d - Waiting for set threshold for %s\n", i, len(jobs), j.Params.Hash)
 			lookup, err := api.StateWaitMsg(ctx, j.SetThresholdCID, 4)
 			if err != nil {
-				return fmt.Errorf("waiting for %s of account %s failed: %w", j.SetThresholdCID, j.Params.Hash, err)
+				return fmt.Errorf("waiting for set threshold (%s) of account %s failed: %w", j.SetThresholdCID, j.Params.Hash, err)
 			}
 
 			if lookup.Receipt.ExitCode != 0 {
