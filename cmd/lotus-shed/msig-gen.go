@@ -78,6 +78,9 @@ type MsigCreationProgress struct {
 
 	SetThresholdCID cid.Cid
 
+	AdminRemovals map[string]cid.Cid
+
+	CreatorRemoveApprovals []cid.Cid
 	//
 
 	SetVestingCID       cid.Cid
@@ -91,8 +94,6 @@ type MsigCreationProgress struct {
 	Complete bool
 
 	SentFunds cid.Cid
-
-	AdminRemovals map[string]cid.Cid
 }
 
 type MsigCreationData struct {
@@ -294,7 +295,7 @@ func parseCreationCsv(fname string) ([]CreateParams, error) {
 			Entity:        r[1],
 			Email:         r[2],
 			Hash:          r[3],
-			Amount:        amt.String(),
+			Amount:        strings.TrimSuffix(amt.String(), " FIL"),
 			VestingMonths: vmonths,
 			Custodian:     r[5],
 			MultisigM:     msigM,
@@ -487,7 +488,7 @@ var msigCreateSetupCmd = &cli.Command{
 					return fmt.Errorf("failed to propose add signer: %w", err)
 				}
 
-				fmt.Printf("\t%d / %d - adding %s in %s\n", i, j.Params.MultisigM-1, a, mcid)
+				fmt.Printf("\t%d / %d - adding %s in %s\n", i+1, len(toAdd), a, mcid)
 				j.AddAddrCids = append(j.AddAddrCids, mcid)
 				if err := writeProgress(); err != nil {
 					return fmt.Errorf("failed to write progress: %w", err)
@@ -497,7 +498,7 @@ var msigCreateSetupCmd = &cli.Command{
 
 		// Now wait for all the adds to land
 		for i, j := range jobs {
-			fmt.Printf("%d / %d - Waiting for add signer for %s\n", i, len(jobs), j.Params.Hash)
+			fmt.Printf("%d / %d - Waiting for add signer for %s\n", i+1, len(jobs), j.Params.Hash)
 			for _, c := range j.AddAddrCids {
 				lookup, err := api.StateWaitMsg(ctx, c, 4)
 				if err != nil {
@@ -632,7 +633,12 @@ var msigCreateSetVestingCmd = &cli.Command{
 var msigCreateSetVestingProposeCmd = &cli.Command{
 	Name:        "propose",
 	Description: "propose the vesting schedule of wallets",
-	Flags:       []cli.Flag{},
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "specify the custodian to run wallet setup for",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
@@ -653,14 +659,33 @@ var msigCreateSetVestingProposeCmd = &cli.Command{
 
 		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
+		custodian := cctx.String("custodian")
+		if custodian == "" {
+			return fmt.Errorf("must specify custodian to run set-vesting for")
+		}
+		if !custodianWhitelist[custodian] {
+			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
+		}
+
+		var jobs []*MsigCreationProgress
 		for _, job := range msd.Jobs {
 			if job.ActorID == address.Undef {
 				fmt.Printf("actor creation not yet complete for %s. Please run 'check-creation'\n", jobStr(job))
 				return nil
 			}
+
+			if job.Params.Custodian == custodian {
+				jobs = append(jobs, job)
+			}
 		}
 
-		for _, job := range msd.Jobs {
+		fmt.Printf("Running vesting configuration for %d wallets from %s\n", len(jobs), custodian)
+
+		for _, job := range jobs {
+			if job.SetVestingCID != cid.Undef {
+				fmt.Printf("vesting proposal already sent for %s, skipping...\n", job.Params.Hash)
+				continue
+			}
 			famt, err := types.ParseFIL(job.Params.Amount)
 			if err != nil {
 				return xerrors.Errorf("failed to parse fil amount: %w", err)
@@ -690,7 +715,12 @@ var msigCreateSetVestingProposeCmd = &cli.Command{
 var msigCreateSetVestingCheckCmd = &cli.Command{
 	Name:        "check",
 	Description: "check that the proposals for set-vesting have landed",
-	Flags:       []cli.Flag{},
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "specify the custodian to run wallet setup for",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
@@ -711,15 +741,30 @@ var msigCreateSetVestingCheckCmd = &cli.Command{
 
 		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
+		custodian := cctx.String("custodian")
+		if custodian == "" {
+			return fmt.Errorf("must specify custodian to run set-vesting for")
+		}
+		if !custodianWhitelist[custodian] {
+			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
+		}
+
+		var jobs []*MsigCreationProgress
 		for _, job := range msd.Jobs {
+			if job.Params.Custodian != custodian {
+				continue
+			}
+
 			if job.SetVestingCID == cid.Undef {
 				fmt.Printf("set vesting operation not yet proposed for %s. Please run 'set-vesting propose'", jobStr(job))
 				return nil
 			}
+
+			jobs = append(jobs, job)
 		}
 
 		fmt.Printf("Hash,SetVestingCID,Applied,ActorID,TxnID,Error\n")
-		for _, job := range msd.Jobs {
+		for _, job := range jobs {
 			pr, err := checkProposeReceipt(ctx, api, job.SetVestingCID)
 			if err != nil {
 				errstr := fmt.Sprintf("set vesting not complete: %s", err)
@@ -799,15 +844,6 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 
 		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
-		findJob := func(hash string) *MsigCreationProgress {
-			for _, job := range msd.Jobs {
-				if job.Params.Hash == hash {
-					return job
-				}
-			}
-			return nil
-		}
-
 		fi, err := os.Open(cctx.Args().Get(1))
 		if err != nil {
 			return err
@@ -869,7 +905,7 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 
 		var complete int
 		for _, svr := range svrows {
-			j := findJob(svr.Hash)
+			j := msd.findJob(svr.Hash)
 			if j.Params.MultisigM <= 1+len(j.SetVestingApprovals) {
 				fmt.Printf("Job %s has sufficient approvals already\n", svr.Hash)
 				complete++
@@ -904,7 +940,7 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 			fmt.Printf("approved txn %d on %s in msg %s\n", svr.TxnID, svr.ActorID, sm.Cid())
 		}
 
-		fmt.Printf("%d / %d jobs complete\n", complete, len(msd.Jobs))
+		fmt.Printf("%d / %d jobs complete\n", complete, len(svrows))
 
 		return nil
 	},
@@ -979,97 +1015,6 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 
 }
 
-/* TODO: unused, delete?
-var msigCreateVerifyCmd = &cli.Command{
-	Name:        "verify",
-	Description: "verify wallets were properly setup",
-	Flags:       []cli.Flag{},
-	Action: func(cctx *cli.Context) error {
-		if !cctx.Args().Present() {
-			return fmt.Errorf("must pass input file")
-		}
-
-		api, closer, err := lcli.GetFullNodeAPI(cctx)
-		if err != nil {
-			return err
-		}
-
-		defer closer()
-		ctx := lcli.ReqContext(cctx)
-
-		curTs, err := api.ChainHead(ctx)
-		if err != nil {
-			return err
-		}
-
-		msd, err := loadMsd(cctx.Args().First())
-		if err != nil {
-			return err
-		}
-
-		for _, job := range msd.Jobs {
-			if !job.Complete {
-				fmt.Printf("%s not complete\n", jobStr(job))
-			} else {
-				act, err := api.StateGetActor(ctx, job.ActorID, types.EmptyTSK)
-				if err != nil {
-					return fmt.Errorf("failed to get actor: %w", err)
-				}
-				fmt.Printf("Wallet: %s - %s\n", jobStr(job), job.ActorID)
-
-				addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
-				if err != nil {
-					return err
-				}
-
-				fmt.Printf("\tID: %s\n", addr)
-
-				amt, err := types.ParseFIL(job.Params.Amount)
-				if err != nil {
-					return fmt.Errorf("failed to parse amount in job create params: %w", err)
-				}
-
-				balanceGood := act.Balance.Equals(big.Int(amt))
-				extra := ""
-				if !balanceGood {
-					extra = fmt.Sprintf("\t(should be %s)", amt)
-				}
-				goodbad(balanceGood, "\tBalance: %s%s\n", types.FIL(act.Balance), extra)
-
-				if act.Code != builtin.MultisigActorCodeID {
-					fmt.Println("NOT A MULTISIG!!")
-					continue
-				}
-
-				data, err := api.ChainReadObj(ctx, act.Head)
-				if err != nil {
-					return fmt.Errorf("failed to read state: %w", err)
-				}
-
-				var msigst msig.State
-				if err := msigst.UnmarshalCBOR(bytes.NewReader(data)); err != nil {
-					return err
-				}
-
-				addrsCorrect := addressesAreSame(job.Params.Addresses, msigst.Signers)
-				goodbad(addrsCorrect, "\t%s\n", msigst.Signers)
-
-				expDuration := abi.ChainEpoch(blocksInAMonth * job.Params.VestingMonths)
-				durGood := msigst.UnlockDuration == expDuration
-				goodbad(durGood, "\tVesting Duration: %d (%d months)\n", msigst.UnlockDuration, msigst.UnlockDuration/blocksInAMonth)
-				expSpendable := types.FIL(types.BigSub(big.Int(amt), msigst.AmountLocked(curTs.Height())))
-				elapsedPerc := 100 * float64(curTs.Height()-msigst.StartEpoch) / float64(msigst.UnlockDuration)
-				fmt.Printf("\tSpendable: (%0.1f) %s (exp: %s)\n", elapsedPerc, types.FIL(types.BigSub(act.Balance, msigst.AmountLocked(curTs.Height()))), expSpendable)
-
-				fmt.Println()
-			}
-		}
-
-		return nil
-	},
-}
-*/
-
 func goodbad(good bool, format string, args ...interface{}) {
 	if good {
 		color.Green(format, args...)
@@ -1121,6 +1066,10 @@ var msigCreateFillProposeCmd = &cli.Command{
 			Name:  "signer",
 			Usage: "address of signer for the 'source' multisig",
 		},
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "specify the custodian to run wallet setup for",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
@@ -1152,14 +1101,29 @@ var msigCreateFillProposeCmd = &cli.Command{
 			return fmt.Errorf("failed to parse 'signer' address: %w", err)
 		}
 
+		custodian := cctx.String("custodian")
+		if custodian == "" {
+			return fmt.Errorf("must specify custodian to run set-vesting for")
+		}
+		if !custodianWhitelist[custodian] {
+			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
+		}
+
+		var jobs []*MsigCreationProgress
 		for _, job := range msd.Jobs {
+			if job.Params.Custodian != custodian {
+				continue
+			}
+
 			if !job.FundsLocked {
 				return fmt.Errorf("vesting schedule not set for all wallets yet, please set vesting before sending funds")
 			}
+			jobs = append(jobs, job)
 		}
 
-		for _, job := range msd.Jobs {
+		fmt.Printf("sending funding proposals for %d accounts from %s\n", len(jobs), custodian)
 
+		for _, job := range jobs {
 			addr, err := api.StateLookupID(ctx, job.ActorID, types.EmptyTSK)
 			if err != nil {
 				return fmt.Errorf("failed to lookup ID: %w", err)
@@ -1381,7 +1345,7 @@ var msigCreateAuditCreatesCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Printf("Hash,Address,ID,Balance,VestingAmount,VestingStart,VestingDuration,Signers\n")
+		fmt.Printf("Hash,Address,ID,Balance,VestingAmount,VestingStart,VestingDuration,MultisigM,Signers\n")
 		for _, job := range msd.Jobs {
 			if job.ActorID == address.Undef {
 				fmt.Printf("%s,,,,,,,\n", job.Params.Hash)
@@ -1403,7 +1367,7 @@ var msigCreateAuditCreatesCmd = &cli.Command{
 				return fmt.Errorf("failed to lookup public keys for signers: %w", err)
 			}
 
-			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%s\n", job.Params.Hash, job.ActorID, actId, act.Balance, st.InitialBalance, st.StartEpoch, st.UnlockDuration, addrsToColonString(kaddrs))
+			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%d,%s\n", job.Params.Hash, job.ActorID, actId, act.Balance, st.InitialBalance, st.StartEpoch, st.UnlockDuration, st.NumApprovalsThreshold, addrsToColonString(kaddrs))
 
 		}
 		return nil
@@ -1417,6 +1381,10 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 		&cli.StringFlag{
 			Name:  "source",
 			Usage: "source account to audit sends from",
+		},
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "custodian to audit sends for",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -1473,8 +1441,23 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Printf("WalletHash,WalletID,Signers,CurBalance,Proposer,TxnID,Value,LockedAmount\n")
+		custodian := cctx.String("custodian")
+		if custodian == "" {
+			return fmt.Errorf("must specify custodian to run set-vesting for")
+		}
+		if !custodianWhitelist[custodian] {
+			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
+		}
+
+		var jobs []*MsigCreationProgress
 		for _, job := range msd.Jobs {
+			if job.Params.Custodian == custodian {
+				jobs = append(jobs, job)
+			}
+		}
+
+		fmt.Printf("Hash,WalletID,Signers,CurBalance,Proposer,TxnID,Value,LockedAmount\n")
+		for _, job := range jobs {
 			tid := int64(-1)
 			value := abi.NewTokenAmount(0)
 			var proposer address.Address
@@ -1544,9 +1527,9 @@ var msigCreateOutputCsvCmd = &cli.Command{
 			return err
 		}
 
-		fmt.Println("Name,Entity,Hash,Amount,VestingMonths,MultisigM,MultisigN,Addresses,ActorID,MessageID")
+		fmt.Println("Name,Entity,Email,Hash,Amount,Custodian,VestingMonths,MultisigM,MultisigN,Addresses,ActorID,MessageID")
 		for _, job := range msd.Jobs {
-			fmt.Printf("%s,%s,%s,%s,%d,%d,%d,%s,%s,%s\n", job.Params.Name, job.Params.Entity, job.Params.Hash, job.Params.Amount, job.Params.VestingMonths, job.Params.MultisigM, job.Params.MultisigN, addrsToColonString(job.Params.Addresses), job.ActorID, job.CreateCID)
+			fmt.Printf("%s,%q,%s,%s,%s,%s,%d,%d,%d,%s,%s,%s\n", job.Params.Name, job.Params.Entity, job.Params.Email, job.Params.Hash, job.Params.Amount, job.Params.Custodian, job.Params.VestingMonths, job.Params.MultisigM, job.Params.MultisigN, addrsToColonString(job.Params.Addresses), job.ActorID, job.CreateCID)
 		}
 		return nil
 	},
@@ -1568,16 +1551,14 @@ func loadMsd(fname string) (*MsigCreationData, error) {
 }
 
 var msigCreateRemoveAdminsCmd = &cli.Command{
-	Name: "remove-admins",
-	Subcommands: []*cli.Command{
-		msigCreateRemoveAdminsProposeCmd,
-	},
-}
-
-var msigCreateRemoveAdminsProposeCmd = &cli.Command{
-	Name:        "propose",
+	Name:        "remove-admins",
 	Description: "proposes removal of admin addresses from wallets",
-	Flags:       []cli.Flag{},
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "custodian to audit sends for",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
@@ -1598,8 +1579,23 @@ var msigCreateRemoveAdminsProposeCmd = &cli.Command{
 
 		writeProgress := getProgressWriter(cctx.Args().First(), msd)
 
-		// First, ensure the wallets have the other addresses set on them properly
+		custodian := cctx.String("custodian")
+		if custodian == "" {
+			return fmt.Errorf("must specify custodian to run set-vesting for")
+		}
+		if !custodianWhitelist[custodian] {
+			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
+		}
+
+		var jobs []*MsigCreationProgress
 		for _, job := range msd.Jobs {
+			if job.Params.Custodian == custodian {
+				jobs = append(jobs, job)
+			}
+		}
+
+		// First, ensure the wallets have the other addresses set on them properly
+		for _, job := range jobs {
 			mstate, _, err := getMsigState(ctx, api, job.ActorID)
 			if err != nil {
 				return err
@@ -1622,15 +1618,20 @@ var msigCreateRemoveAdminsProposeCmd = &cli.Command{
 			}
 		}
 
-		for _, job := range msd.Jobs {
+		for _, job := range jobs {
 			if job.AdminRemovals == nil {
 				job.AdminRemovals = make(map[string]cid.Cid)
 			}
 
-			for _, a := range msd.AdminAux {
+			numAux := job.Params.MultisigM - 1
+			for _, a := range append([]address.Address{msd.Creator}, msd.AdminAux[:numAux]...) {
+				if _, ok := job.AdminRemovals[a.String()]; ok {
+					fmt.Printf("Account %s already proposed removal of admin key %s\n", job.Params.Hash, a)
+					continue
+				}
 				params := &msig.RemoveSignerParams{Signer: a}
 
-				propCid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
+				propCid, err := msigPropose(ctx, api, a, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
 				if err != nil {
 					return fmt.Errorf("failed to propose removal: %w", err)
 				}
@@ -1639,18 +1640,88 @@ var msigCreateRemoveAdminsProposeCmd = &cli.Command{
 				if err := writeProgress(); err != nil {
 					return err
 				}
+				fmt.Printf("Account %s (addr %s) proposed removal of %s in %s\n", job.Params.Hash, job.ActorID, a, propCid)
+			}
+		}
+
+		for _, job := range jobs {
+			// Now wait for all those to complete...
+			for addr, c := range job.AdminRemovals {
+				fmt.Printf("wait for removal proposal of %s on account %s (%s)\n", addr, job.Params.Hash, c)
+				lookup, err := api.StateWaitMsg(ctx, c, 4)
+				if err != nil {
+					return err
+				}
+
+				if lookup.Receipt.ExitCode != 0 {
+					return fmt.Errorf("remove proposal %s failed: exitcode %d", c, lookup.Receipt.ExitCode)
+				}
+			}
+		}
+
+		// For accounts with M > 1, approve the removal of our first key
+		for _, job := range jobs {
+			if job.Params.MultisigM == 1 {
+				continue
 			}
 
-			params := &msig.RemoveSignerParams{Signer: msd.Creator}
-
-			propCid, err := msigPropose(ctx, api, msd.Creator, job.ActorID, params, builtin.MethodsMultisig.RemoveSigner)
+			propCid := job.AdminRemovals[msd.Creator.String()]
+			propRet, err := checkProposeReceipt(ctx, api, propCid)
 			if err != nil {
-				return fmt.Errorf("failed to propose removal: %w", err)
+				return err
 			}
 
-			job.AdminRemovals[msd.Creator.String()] = propCid
-			if err := writeProgress(); err != nil {
+			_, act, err := getMsigState(ctx, api, job.ActorID)
+			if err != nil {
 				return err
+			}
+
+			store := adt.WrapStore(ctx, cbor.NewCborStore(apibstore.NewAPIBlockstore(api)))
+			msigst, err := multisig.Load(store, act)
+			if err != nil {
+				return err
+			}
+
+			var found bool
+			if err := msigst.ForEachPendingTxn(func(id int64, txn multisig.Transaction) error {
+				if id == int64(propRet.TxnID) {
+					found = true
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+
+			if !found {
+				fmt.Printf("proposal to remove address (%s) no longer found on chain...\n", propCid)
+				continue
+			}
+
+			numAux := job.Params.MultisigM - 1
+			for _, a := range msd.AdminAux[:numAux] {
+				fmt.Printf("Approving txn %d for account %s (%s) with key %s\n", propRet.TxnID, job.Params.Hash, job.ActorID, a)
+				params := &msig.TxnIDParams{
+					ID: propRet.TxnID,
+				}
+
+				buf := new(bytes.Buffer)
+				if err := params.MarshalCBOR(buf); err != nil {
+					return err
+				}
+
+				msg := &types.Message{
+					To:     job.ActorID,
+					From:   a,
+					Method: builtin.MethodsMultisig.Approve,
+					Params: buf.Bytes(),
+				}
+
+				smsg, err := api.MpoolPushMessage(ctx, msg, nil)
+				if err != nil {
+					return err
+				}
+
+				fmt.Printf("approved removal of %s in %s\n", msd.Creator, smsg.Cid())
 			}
 		}
 
