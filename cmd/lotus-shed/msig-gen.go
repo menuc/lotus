@@ -823,6 +823,9 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 			Name:  "admin-key",
 			Usage: "specify admin key to approve set vesting with",
 		},
+		&cli.BoolFlag{
+			Name: "force",
+		},
 	},
 	Action: func(cctx *cli.Context) error {
 		if cctx.Args().Len() != 2 {
@@ -906,7 +909,7 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 		var complete int
 		for _, svr := range svrows {
 			j := msd.findJob(svr.Hash)
-			if j.Params.MultisigM <= 1+len(j.SetVestingApprovals) {
+			if !cctx.Bool("force") && j.Params.MultisigM <= 1+len(j.SetVestingApprovals) {
 				fmt.Printf("Job %s has sufficient approvals already\n", svr.Hash)
 				complete++
 				continue
@@ -929,7 +932,8 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 
 			sm, err := api.MpoolPushMessage(ctx, msg, nil)
 			if err != nil {
-				return fmt.Errorf("mpool push message failed: %w", err)
+				fmt.Printf("mpool push message failed: %s", err)
+				continue
 			}
 
 			j.SetVestingApprovals = append(j.SetVestingApprovals, sm.Cid())
@@ -1327,6 +1331,12 @@ var msigCreateAuditsCmd = &cli.Command{
 var msigCreateAuditCreatesCmd = &cli.Command{
 	Name:        "creates",
 	Description: "produce an audit report of all created multisigs",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "custodian",
+			Usage: "optionally filter by a particular custodian",
+		},
+	},
 	Action: func(cctx *cli.Context) error {
 		if !cctx.Args().Present() {
 			return fmt.Errorf("must pass input file")
@@ -1345,8 +1355,13 @@ var msigCreateAuditCreatesCmd = &cli.Command{
 			return err
 		}
 
+		custodian := cctx.String("custodian")
 		fmt.Printf("Hash,Address,ID,Balance,VestingAmount,VestingStart,VestingDuration,MultisigM,Signers\n")
 		for _, job := range msd.Jobs {
+			if custodian != "" && job.Params.Custodian != custodian {
+				continue
+			}
+
 			if job.ActorID == address.Undef {
 				fmt.Printf("%s,,,,,,,\n", job.Params.Hash)
 				continue
@@ -1443,7 +1458,7 @@ var msigCreatePaymentConfirmationAuditCmd = &cli.Command{
 
 		custodian := cctx.String("custodian")
 		if custodian == "" {
-			return fmt.Errorf("must specify custodian to run set-vesting for")
+			return fmt.Errorf("must specify custodian to run funding audit for")
 		}
 		if !custodianWhitelist[custodian] {
 			return fmt.Errorf("%q is not a whitelisted custodian", custodian)
@@ -1722,6 +1737,10 @@ var msigCreateRemoveAdminsCmd = &cli.Command{
 				}
 
 				fmt.Printf("approved removal of %s in %s\n", msd.Creator, smsg.Cid())
+				job.CreatorRemoveApprovals = append(job.CreatorRemoveApprovals, smsg.Cid())
+				if err := writeProgress(); err != nil {
+					return fmt.Errorf("failed to write progress: %w", err)
+				}
 			}
 		}
 
