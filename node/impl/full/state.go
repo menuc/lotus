@@ -1124,6 +1124,19 @@ func (a *StateAPI) StateCirculatingSupply(ctx context.Context, tsk types.TipSetK
 	return a.StateManager.GetCirculatingSupplyDetailed(ctx, ts.Height(), sTree)
 }
 
+func (a *StateAPI) StateExactCirculatingSupply(ctx context.Context, tsk types.TipSetKey) (abi.TokenAmount, error) {
+	ts, err := a.Chain.GetTipSetFromKey(tsk)
+	if err != nil {
+		return types.EmptyInt, xerrors.Errorf("loading tipset %s: %w", tsk, err)
+	}
+
+	sTree, err := a.stateForTs(ctx, ts)
+	if err != nil {
+		return types.EmptyInt, err
+	}
+	return a.StateManager.GetExactCirculatingSupply(ctx, ts.Height(), sTree)
+}
+
 func (a *StateAPI) StateNetworkVersion(ctx context.Context, tsk types.TipSetKey) (network.Version, error) {
 	ts, err := a.Chain.GetTipSetFromKey(tsk)
 	if err != nil {

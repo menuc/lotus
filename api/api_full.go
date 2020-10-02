@@ -400,6 +400,9 @@ type FullNode interface {
 
 	// StateCirculatingSupply returns the circulating supply of Filecoin at the given tipset
 	StateCirculatingSupply(context.Context, types.TipSetKey) (CirculatingSupply, error)
+	// TODO: Remove StateCirculatingSupply maybe?
+	// StateExactCirculatingSupply returns the exact circulating supply of Filecoin at the given tipset
+	StateExactCirculatingSupply(context.Context, types.TipSetKey) (abi.TokenAmount, error)
 	// StateNetworkVersion returns the network version at the given tipset
 	StateNetworkVersion(context.Context, types.TipSetKey) (network.Version, error)
 

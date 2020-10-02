@@ -3,6 +3,10 @@ package builtin
 import (
 	"fmt"
 
+	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
+
+	"github.com/filecoin-project/go-address"
+
 	"github.com/filecoin-project/go-state-types/abi"
 	miner0 "github.com/filecoin-project/specs-actors/actors/builtin/miner"
 	proof0 "github.com/filecoin-project/specs-actors/actors/runtime/proof"
@@ -11,6 +15,11 @@ import (
 
 	"github.com/filecoin-project/go-state-types/network"
 )
+
+var SystemActorAddr = builtin0.SystemActorAddr
+var BurntFundsActorAddr = builtin0.BurntFundsActorAddr
+var CronActorAddr = builtin0.CronActorAddr
+var ReserveAddress = makeAddress("t090")
 
 type Version int
 
@@ -40,4 +49,13 @@ func FromV0FilterEstimate(v0 smoothing0.FilterEstimate) FilterEstimate {
 // Doesn't change between actors v0 and v1
 func QAPowerForWeight(size abi.SectorSize, duration abi.ChainEpoch, dealWeight, verifiedWeight abi.DealWeight) abi.StoragePower {
 	return miner0.QAPowerForWeight(size, duration, dealWeight, verifiedWeight)
+}
+
+func makeAddress(addr string) address.Address {
+	ret, err := address.NewFromString(addr)
+	if err != nil {
+		panic(err)
+	}
+
+	return ret
 }

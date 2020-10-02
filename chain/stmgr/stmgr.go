@@ -5,6 +5,12 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/filecoin-project/lotus/chain/actors/builtin/verifreg"
+
+	_init "github.com/filecoin-project/lotus/chain/actors/builtin/init"
+
+	"github.com/filecoin-project/lotus/chain/actors/builtin/miner"
+
 	builtin0 "github.com/filecoin-project/specs-actors/actors/builtin"
 	msig0 "github.com/filecoin-project/specs-actors/actors/builtin/multisig"
 
@@ -1255,6 +1261,90 @@ func (sm *StateManager) GetCirculatingSupply(ctx context.Context, height abi.Cha
 	}
 
 	return csi.FilCirculating, nil
+}
+
+func (sm *StateManager) GetExactCirculatingSupply(ctx context.Context, height abi.ChainEpoch, st *state.StateTree) (abi.TokenAmount, error) {
+	circ := big.Zero()
+	unCirc := big.Zero()
+	err := st.ForEach(func(a address.Address, actor *types.Actor) error {
+		switch {
+		case a == _init.Address ||
+			a == reward.Address ||
+			a == verifreg.Address ||
+			// The power actor itself should never receive funds
+			a == power.Address ||
+			a == builtin.SystemActorAddr ||
+			a == builtin.CronActorAddr ||
+			a == builtin.BurntFundsActorAddr ||
+			a == builtin.ReserveAddress:
+
+			unCirc = big.Add(unCirc, actor.Balance)
+
+		case a == market.Address:
+			mst, err := market.Load(sm.cs.Store(ctx), actor)
+			if err != nil {
+				return err
+			}
+
+			lb, err := mst.TotalLocked()
+			if err != nil {
+				return err
+			}
+
+			circ = big.Add(circ, big.Sub(actor.Balance, lb))
+			unCirc = big.Add(unCirc, lb)
+
+		case actor.IsAccountActor() || actor.IsPaymentChannelActor():
+			circ = big.Add(circ, actor.Balance)
+
+		case actor.IsStorageMinerActor():
+			mst, err := miner.Load(sm.cs.Store(ctx), actor)
+			if err != nil {
+				return err
+			}
+
+			ab, err := mst.AvailableBalance(actor.Balance)
+
+			if err == nil {
+				circ = big.Add(circ, ab)
+				unCirc = big.Add(unCirc, big.Sub(actor.Balance, ab))
+			} else {
+				// Assume any error is because the miner state is "broken" (lower actor balance than locked funds)
+				// In this case, the actor's entire balance is considered "uncirculating"
+				unCirc = big.Add(unCirc, actor.Balance)
+			}
+
+		case actor.IsMultisigActor():
+			mst, err := multisig.Load(sm.cs.Store(ctx), actor)
+			if err != nil {
+				return err
+			}
+
+			lb, err := mst.LockedBalance(height)
+			if err != nil {
+				return err
+			}
+
+			ab := big.Sub(actor.Balance, lb)
+			circ = big.Add(circ, big.Max(ab, big.Zero()))
+			unCirc = big.Add(unCirc, big.Min(actor.Balance, lb))
+		default:
+			return xerrors.Errorf("unexpected actor: %s", a)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return types.EmptyInt, err
+	}
+
+	total := big.Add(circ, unCirc)
+	if !total.Equals(types.TotalFilecoinInt) {
+		return types.EmptyInt, xerrors.Errorf("total filecoin didn't add to expected amount: %s != %s", total, types.TotalFilecoinInt)
+	}
+
+	return circ, nil
 }
 
 func (sm *StateManager) GetNtwkVersion(ctx context.Context, height abi.ChainEpoch) network.Version {

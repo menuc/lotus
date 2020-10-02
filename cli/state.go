@@ -57,6 +57,7 @@ var stateCmd = &cli.Command{
 		stateListActorsCmd,
 		stateListMinersCmd,
 		stateCircSupplyCmd,
+		stateExactCircSupplyCmd,
 		stateSectorCmd,
 		stateGetActorCmd,
 		stateLookupIDCmd,
@@ -1634,6 +1635,34 @@ var stateCircSupplyCmd = &cli.Command{
 		fmt.Println("Burnt: ", types.FIL(circ.FilBurnt))
 		fmt.Println("Locked: ", types.FIL(circ.FilLocked))
 
+		return nil
+	},
+}
+
+// TODO: Remove stateCircSupplyCmd
+var stateExactCircSupplyCmd = &cli.Command{
+	Name:  "exact-circulating-supply",
+	Usage: "Get the exact current circulating supply of filecoin",
+	Action: func(cctx *cli.Context) error {
+		api, closer, err := GetFullNodeAPI(cctx)
+		if err != nil {
+			return err
+		}
+		defer closer()
+
+		ctx := ReqContext(cctx)
+
+		ts, err := LoadTipSet(ctx, cctx, api)
+		if err != nil {
+			return err
+		}
+
+		circ, err := api.StateExactCirculatingSupply(ctx, ts.Key())
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("Circulating supply: ", types.FIL(circ))
 		return nil
 	},
 }
