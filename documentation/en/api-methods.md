@@ -126,6 +126,7 @@
   * [StateCirculatingSupply](#StateCirculatingSupply)
   * [StateCompute](#StateCompute)
   * [StateDealProviderCollateralBounds](#StateDealProviderCollateralBounds)
+  * [StateExactCirculatingSupply](#StateExactCirculatingSupply)
   * [StateGetActor](#StateGetActor)
   * [StateGetReceipt](#StateGetReceipt)
   * [StateListActors](#StateListActors)
@@ -3034,6 +3035,29 @@ Response:
   "Max": "0"
 }
 ```
+
+### StateExactCirculatingSupply
+TODO: Remove StateCirculatingSupply maybe?
+StateExactCirculatingSupply returns the exact circulating supply of Filecoin at the given tipset
+
+
+Perms: read
+
+Inputs:
+```json
+[
+  [
+    {
+      "/": "bafy2bzacea3wsdh6y3a36tb3skempjoxqpuyompjbmfeyf34fi3uy6uue42v4"
+    },
+    {
+      "/": "bafy2bzacebp3shtrn43k7g3unredz7fxn4gj533d3o43tqn2p2ipxxhrvchve"
+    }
+  ]
+]
+```
+
+Response: `"0"`
 
 ### StateGetActor
 StateGetActor returns the indicated actor's nonce and balance.
