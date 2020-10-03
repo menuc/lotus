@@ -1276,6 +1276,7 @@ func (sm *StateManager) GetExactCirculatingSupply(ctx context.Context, height ab
 			a == builtin.SystemActorAddr ||
 			a == builtin.CronActorAddr ||
 			a == builtin.BurntFundsActorAddr ||
+			a == builtin.SaftAddress ||
 			a == builtin.ReserveAddress:
 
 			unCirc = big.Add(unCirc, actor.Balance)

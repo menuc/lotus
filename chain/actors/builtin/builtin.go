@@ -19,6 +19,7 @@ import (
 var SystemActorAddr = builtin0.SystemActorAddr
 var BurntFundsActorAddr = builtin0.BurntFundsActorAddr
 var CronActorAddr = builtin0.CronActorAddr
+var SaftAddress = makeAddress("t0122")
 var ReserveAddress = makeAddress("t090")
 
 type Version int
