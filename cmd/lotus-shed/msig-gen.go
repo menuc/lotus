@@ -63,6 +63,10 @@ type CreateParams struct {
 	MultisigM     int
 	MultisigN     int
 	Addresses     []address.Address
+
+	OutAddress          address.Address
+	OutCreateMsg        cid.Cid
+	ApprovalForTransfer bool
 }
 
 func jobStr(job *MsigCreationProgress) string {
@@ -246,7 +250,7 @@ func parseCreationCsv(fname string) ([]CreateParams, error) {
 
 	var out []CreateParams
 	for i, r := range records[1:] {
-		if len(r) < 9 {
+		if len(r) < 13 {
 			return nil, fmt.Errorf("records on row %d were invalid", i)
 		}
 
@@ -290,17 +294,49 @@ func parseCreationCsv(fname string) ([]CreateParams, error) {
 			return nil, fmt.Errorf("row %d: M value greater than number of addresses", i)
 		}
 
+		var addr address.Address
+		if r[10] != "" {
+			ca, err := address.NewFromString(r[10])
+			if err != nil {
+				return nil, xerrors.Errorf("actor ID field invalid (row %d): %w", i, err)
+			}
+			addr = ca
+		}
+
+		var msgCid cid.Cid
+		if r[11] != "" {
+			mc, err := cid.Decode(r[11])
+			if err != nil {
+				return nil, xerrors.Errorf("failed to decode msg cid (row %d): %w", i, err)
+			}
+
+			msgCid = mc
+		}
+
+		var approval bool
+		if r[12] != "" {
+			low := strings.ToLower(r[12])
+			if low == "true" {
+				approval = true
+			} else if low != "false" {
+				return nil, fmt.Errorf("expected either 'true' or 'false' in ApprovalForTransfer in row %d", i)
+			}
+		}
+
 		p := CreateParams{
-			Name:          r[0],
-			Entity:        r[1],
-			Email:         r[2],
-			Hash:          r[3],
-			Amount:        strings.TrimSuffix(amt.String(), " FIL"),
-			VestingMonths: vmonths,
-			Custodian:     r[5],
-			MultisigM:     msigM,
-			MultisigN:     msigN,
-			Addresses:     addresses,
+			Name:                r[0],
+			Entity:              r[1],
+			Email:               r[2],
+			Hash:                r[3],
+			Amount:              strings.TrimSuffix(amt.String(), " FIL"),
+			VestingMonths:       vmonths,
+			Custodian:           r[5],
+			MultisigM:           msigM,
+			MultisigN:           msigN,
+			Addresses:           addresses,
+			OutAddress:          addr,
+			OutCreateMsg:        msgCid,
+			ApprovalForTransfer: approval,
 		}
 
 		out = append(out, p)
@@ -441,6 +477,10 @@ var msigCreateSetupCmd = &cli.Command{
 
 			if job.Params.MultisigM == 0 {
 				return fmt.Errorf("account %s does not have M set", job.Params.Hash)
+			}
+
+			if job.ActorID != inp.OutAddress {
+				return fmt.Errorf("master csv Actor address did not match creation progress data for %s", job.Params.Hash)
 			}
 
 			job.Params = inp
@@ -868,7 +908,6 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 
 		var svrows []setVestingRow
 		for _, r := range rows[1:] {
-
 			svc, err := cid.Decode(r[1])
 			if err != nil {
 				return fmt.Errorf("decoding cid %s: %w", r[1], err)
@@ -944,6 +983,22 @@ var msigCreateSetVestingApproveCmd = &cli.Command{
 			fmt.Printf("approved txn %d on %s in msg %s\n", svr.TxnID, svr.ActorID, sm.Cid())
 		}
 
+		for _, svr := range svrows {
+			j := msd.findJob(svr.Hash)
+
+			for i, appcid := range j.SetVestingApprovals {
+				fmt.Printf("waiting for approval %d / %d for account %s to land on chain (msdcid: %s)\n", i, len(j.SetVestingApprovals), j.Params.Hash, appcid)
+				lookup, err := api.StateWaitMsg(ctx, appcid, 4)
+				if err != nil {
+					return fmt.Errorf("failed to wait for msg on chain: %w", err)
+				}
+
+				if lookup.Receipt.ExitCode != 0 {
+					return fmt.Errorf("set-vesting approval (%s) for account %s failed with exit code %d", appcid, j.Params.Hash, lookup.Receipt.ExitCode)
+				}
+			}
+		}
+
 		fmt.Printf("%d / %d jobs complete\n", complete, len(svrows))
 
 		return nil
@@ -1016,7 +1071,6 @@ func msigPropose(ctx context.Context, api api.FullNode, sender address.Address, 
 	}
 
 	return sm.Cid(), nil
-
 }
 
 func goodbad(good bool, format string, args ...interface{}) {
@@ -1675,46 +1729,57 @@ var msigCreateRemoveAdminsCmd = &cli.Command{
 		}
 
 		// For accounts with M > 1, approve the removal of our first key
-		for _, job := range jobs {
-			if job.Params.MultisigM == 1 {
-				continue
-			}
 
-			propCid := job.AdminRemovals[msd.Creator.String()]
-			propRet, err := checkProposeReceipt(ctx, api, propCid)
-			if err != nil {
-				return err
-			}
-
-			_, act, err := getMsigState(ctx, api, job.ActorID)
-			if err != nil {
-				return err
-			}
-
-			store := adt.WrapStore(ctx, cbor.NewCborStore(apibstore.NewAPIBlockstore(api)))
-			msigst, err := multisig.Load(store, act)
-			if err != nil {
-				return err
-			}
-
-			var found bool
-			if err := msigst.ForEachPendingTxn(func(id int64, txn multisig.Transaction) error {
-				if id == int64(propRet.TxnID) {
-					found = true
+		complete := 0
+		for loop := 0; complete < len(jobs); loop++ {
+			for _, job := range jobs {
+				if job.Params.MultisigM == 1 {
+					complete++
+					continue
 				}
-				return nil
-			}); err != nil {
-				return err
-			}
 
-			if !found {
-				fmt.Printf("proposal to remove address (%s) no longer found on chain...\n", propCid)
-				continue
-			}
+				propCid := job.AdminRemovals[msd.Creator.String()]
+				propRet, err := checkProposeReceipt(ctx, api, propCid)
+				if err != nil {
+					return err
+				}
 
-			numAux := job.Params.MultisigM - 1
-			for _, a := range msd.AdminAux[:numAux] {
-				fmt.Printf("Approving txn %d for account %s (%s) with key %s\n", propRet.TxnID, job.Params.Hash, job.ActorID, a)
+				_, act, err := getMsigState(ctx, api, job.ActorID)
+				if err != nil {
+					return err
+				}
+
+				store := adt.WrapStore(ctx, cbor.NewCborStore(apibstore.NewAPIBlockstore(api)))
+				msigst, err := multisig.Load(store, act)
+				if err != nil {
+					return err
+				}
+
+				var found bool
+				if err := msigst.ForEachPendingTxn(func(id int64, txn multisig.Transaction) error {
+					if id == int64(propRet.TxnID) {
+						found = true
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+
+				if !found {
+					fmt.Printf("proposal to remove address (%s) no longer found on chain...\n", propCid)
+					continue
+				}
+
+				numAux := job.Params.MultisigM - 1
+
+				if len(job.CreatorRemoveApprovals) >= numAux {
+					fmt.Printf("Already have enough approvals for %s (%s)\n", job.Params.Hash, job.ActorID)
+					complete++
+					continue
+				}
+
+				next := msd.AdminAux[len(job.CreatorRemoveApprovals)]
+				fmt.Printf("Approving txn %d for account %s (%s) with key %s\n", propRet.TxnID, job.Params.Hash, job.ActorID, next)
 				params := &msig.TxnIDParams{
 					ID: propRet.TxnID,
 				}
@@ -1726,7 +1791,7 @@ var msigCreateRemoveAdminsCmd = &cli.Command{
 
 				msg := &types.Message{
 					To:     job.ActorID,
-					From:   a,
+					From:   next,
 					Method: builtin.MethodsMultisig.Approve,
 					Params: buf.Bytes(),
 				}
@@ -1742,6 +1807,21 @@ var msigCreateRemoveAdminsCmd = &cli.Command{
 					return fmt.Errorf("failed to write progress: %w", err)
 				}
 			}
+
+			for _, job := range jobs {
+				for _, apc := range job.CreatorRemoveApprovals {
+					fmt.Printf("waiting for confirmation on creator removal: %s\n", apc)
+					lookup, err := api.StateWaitMsg(ctx, apc, 4)
+					if err != nil {
+						return fmt.Errorf("failed to wait for msg: %w", err)
+					}
+
+					if lookup.Receipt.ExitCode != 0 {
+						return fmt.Errorf("approval failed: exitcode %d", lookup.Receipt.ExitCode)
+					}
+				}
+			}
+
 		}
 
 		return nil
